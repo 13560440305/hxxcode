@@ -1,0 +1,77 @@
+{
+  "name": "opencode-bridge",
+  "displayName": "HxxCode",
+  "description": "在 VS Code 中通过 HxxCode 运行 AI 编码 Agent，模型请求经 NewAPI 网关聚合，支持自由配置供应商",
+  "version": "0.1.0",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["AI", "Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencodeBridge",
+          "title": "HxxCode",
+          "icon": "media/logo.svg"
+        }
+      ]
+    },
+    "views": {
+      "opencodeBridge": [
+        {
+          "type": "webview",
+          "id": "opencodeBridge.chatView",
+          "name": "聊天"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "opencodeBridge.openSettings",
+        "title": "HxxCode: 打开供应商设置",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "opencodeBridge.startServer",
+        "title": "HxxCode: 启动 / 重启 Server"
+      },
+      {
+        "command": "opencodeBridge.showDiag",
+        "title": "HxxCode: 打开诊断日志"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "opencodeBridge.openSettings",
+          "when": "view == opencodeBridge.chatView",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "HxxCode",
+      "properties": {
+        "opencodeBridge.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "打开工作区时自动启动 HxxCode server"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "file:lib/@opencode-ai/sdk"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0"
+  }
+}
