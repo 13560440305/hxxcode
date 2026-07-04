@@ -70,9 +70,10 @@
     }
   },
   "scripts": {
+    "compile": "esbuild ./extension.ts --bundle --external:vscode --outfile=out/extension.js --platform=node --target=node20 --format=cjs --sourcemap=inline",
     "build": "esbuild ./extension.ts --bundle --external:vscode --outfile=out/extension.js --platform=node --target=node20 --format=cjs --sourcemap=inline",
     "watch": "esbuild ./extension.ts --bundle --external:vscode --outfile=out/extension.js --platform=node --target=node20 --format=cjs --sourcemap=inline --watch",
-    "package": "npm run build && npx @vscode/vsce package --allow-missing-repository --no-dependencies"
+    "package": "npm run compile && npx @vscode/vsce package --allow-missing-repository --no-dependencies"
   },
   "dependencies": {
     "@opencode-ai/sdk": "file:lib/@opencode-ai/sdk"

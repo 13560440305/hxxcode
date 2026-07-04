@@ -6,6 +6,7 @@ import { ChatViewProvider } from "./chatViewProvider";
 
 import { log, showDiag } from "./log";
 import { getHxxCodeDir } from "./storage";
+import { checkCommandExists, detectFirstAvailableBackend } from "./agentBackend";
 
 export async function activate(context: vscode.ExtensionContext) {
   log("=== HxxCode 扩展激活 ===");
@@ -23,6 +24,36 @@ export async function activate(context: vscode.ExtensionContext) {
   log("providers:", providerStore.list());
   log("active:", providerStore.getActive());
   log("agent backend:", providerStore.getActiveAgentBackend());
+
+  // ── 自动检测可用的 CLI 后端 ──────────────────────────────────────────
+  const currentBackend = providerStore.getActiveAgentBackend();
+  const hasLildax = checkCommandExists("lildax");
+  const hasOpencode = checkCommandExists("opencode");
+
+  // 若配置了 opencode 别名但 lildax 可用，自动切到 lildax
+  if (currentBackend.id === "opencode-ai/cli:opencode" && hasLildax) {
+    log("检测到 lildax 可用，自动从 opencode 别名切换到 lildax");
+    await providerStore.setActiveAgentBackend("opencode-ai/cli");
+    log("agent backend (auto-switched):", providerStore.getActiveAgentBackend());
+  } else if (!checkCommandExists(currentBackend.command)) {
+    const detected = detectFirstAvailableBackend();
+    if (detected) {
+      log(`当前后端的命令「${currentBackend.command}」不可用，自动切换到「${detected}」`);
+      await providerStore.setActiveAgentBackend(detected);
+      log("agent backend (auto-detected):", providerStore.getActiveAgentBackend());
+    } else {
+      log("⚠ 未检测到任何 Agent CLI（lildax / opencode），请安装 @opencode-ai/cli");
+    }
+  } else {
+    log(`Agent CLI「${providerStore.getActiveAgentBackend().command}」可用`);
+  }
+
+  if (!hasLildax && hasOpencode) {
+    log("⚠ 仅检测到标准 opencode CLI (v1.x)，HxxCode 需要 OpenCode 2.0 (lildax)。请运行: npm install -g @opencode-ai/cli");
+    void vscode.window.showWarningMessage(
+      "HxxCode 需要 OpenCode 2.0 预览版 (lildax)。当前 opencode 1.x 与扩展不兼容，请运行 npm install -g @opencode-ai/cli，并执行 kill $(lsof -t -i :4096) 释放端口。"
+    );
+  }
 
   const opencodeManager = new OpencodeManager(context, providerStore, workspaceRoot);
   context.subscriptions.push(opencodeManager);
@@ -63,12 +94,11 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // 启动 OpenCode Server（需要 opencode CLI 在 PATH 上）
+  // 启动 OpenCode Server（需要 lildax CLI 在 PATH 上）
   await opencodeManager.start().catch((err) => {
     const msg = (err as Error).message;
     log("opencodeManager.start() 失败:", msg);
-    // 启动失败时给用户一个可操作的提示，但扩展继续激活
-    // 用户发送第一条消息时会 triggers ensureClient() 的自动重试
+    void vscode.window.showErrorMessage(`HxxCode 启动失败：${msg}`);
   });
 
   log("数据目录:", getHxxCodeDir());

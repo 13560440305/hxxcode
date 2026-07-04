@@ -3,7 +3,39 @@
  * 默认使用官方 @opencode-ai/cli；可在 ~/.hxxcode/config.json 切换或注册定制版。
  */
 
+import { execSync } from "child_process";
+
 export type AgentProtocol = "opencode-sdk";
+
+/**
+ * 检测命令是否在 PATH 上可用。
+ * 跨平台：Windows 用 where，macOS/Linux 用 command -v。
+ */
+export function checkCommandExists(command: string): boolean {
+  try {
+    if (process.platform === "win32") {
+      execSync(`where ${command}`, { stdio: "ignore" });
+    } else {
+      execSync(`command -v ${command}`, { stdio: "ignore" });
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 自动检测系统上可用的第一个内置 CLI 后端 ID。
+ * 按优先级检测：lildax → opencode → null
+ */
+export function detectFirstAvailableBackend(): string | null {
+  for (const backend of BUILTIN_BACKENDS) {
+    if (checkCommandExists(backend.command)) {
+      return backend.id;
+    }
+  }
+  return null;
+}
 
 /** 内置或用户注册的 Agent 后端定义 */
 export interface AgentBackendDefinition {
