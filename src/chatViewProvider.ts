@@ -3,7 +3,7 @@ import * as path from "path";
 import * as fs from "fs/promises";
 import { OpencodeManager, StreamEvent } from "./opencodeManager";
 import { ProviderStore, ProviderConfig } from "./providerStore";
-import { log } from "./log";
+import { log, showDiag } from "./log";
 import { getSessionsDir, getSessionPath, ensureDirs, readJSON } from "./storage";
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -376,25 +376,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.sessions.push(session);
     this.activeSessionId = id;
     this.postState();
-    this.saveSessionsToDisk();
 
-    // 在 OpenCode 后端创建 session（非阻塞：失败不影响本地聊天）
-    try {
-      const result = await this.opencodeManager.createSession(session.info.title);
-      if (result?.id) {
-        const oldId = session.info.id;
-        session.info.id = result.id;
-        if (this.activeSessionId === oldId) {
-          this.activeSessionId = result.id;
-        }
-        this.postState();
-        void this.saveSessionsToDisk();
-      }
-    } catch {
-      // 使用本地 ID 继续
+    const result = await this.opencodeManager.createSession(session.info.title);
+    const oldId = session.info.id;
+    session.info.id = result.id;
+    if (this.activeSessionId === oldId) {
+      this.activeSessionId = result.id;
     }
+    this.postState();
+    void this.saveSessionsToDisk();
 
-    return id;
+    return session.info.id;
   }
 
   private deleteSession(sessionId: string): void {
@@ -410,7 +402,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return this.sessions.find((s) => s.info.id === this.activeSessionId);
   }
 
-  // ── 会话持久化（~/.HxxCode/sessions/） ─────────────────────────────────────
+  // ── 会话持久化（~/.hxxcode/sessions/） ─────────────────────────────────────
 
   private async loadSessionsFromDisk(): Promise<void> {
     if (this.sessionsLoaded) return;
@@ -473,12 +465,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // ── 发送消息 ──────────────────────────────────────────────────────────────
 
   private async handleSendMessage(text: string): Promise<void> {
+    showDiag();
+    const flowT0 = Date.now();
+    const flow = (step: string, detail?: unknown) => {
+      const elapsed = Date.now() - flowT0;
+      log(`[flow/send +${elapsed}ms] ${step}`, detail ?? "");
+    };
+
+    flow("用户点击发送", { textLen: text.length, preview: text.slice(0, 60) });
+
     let session = this.getActiveSession();
     if (!session) {
-      const id = await this.createSession();
+      flow("无活跃 session，创建新 session");
+      await this.createSession();
       session = this.getActiveSession();
-      if (!session) return;
+      if (!session) {
+        flow("✗ 创建 session 失败");
+        return;
+      }
     }
+    flow("活跃 session", { id: session.info.id, title: session.info.title });
 
     // 追加用户消息
     session.messages.push({
@@ -507,21 +513,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.abortController = new AbortController();
 
     try {
-      await this.opencodeManager.promptStream(
+      flow("ensureBackendSession 开始");
+      const backendId = await this.opencodeManager.ensureBackendSession(
         session.info.id,
+        session.info.title
+      );
+      flow("ensureBackendSession 完成", { backendId });
+      if (backendId !== session.info.id) {
+        flow("session ID 已更新", { from: session.info.id, to: backendId });
+        session.info.id = backendId;
+        this.postState();
+        void this.saveSessionsToDisk();
+      }
+
+      flow("promptStream 开始");
+      await this.opencodeManager.promptStream(
+        backendId,
         text,
-        (event) => this.handleStreamEvent(session!.info.id, event),
+        (event) => {
+          if (event.type !== "text") {
+            flow("收到事件", { type: event.type, error: event.error });
+          }
+          this.handleStreamEvent(session!.info.id, event);
+        },
         this.abortController.signal
       );
+      flow("promptStream 返回");
     } catch (err) {
       const msg = (err as Error).message;
-      if (msg.includes("aborted") || msg.includes("cancel")) {
+      flow("✗ 发送失败", msg);
+      if (
+        msg.includes("aborted") ||
+        msg.includes("cancel") ||
+        msg.includes("terminated")
+      ) {
         assistantMsg.text += "\n\n*已取消*";
       } else {
         this.postError(msg);
         assistantMsg.text += `\n\n**错误**: ${msg}`;
       }
     } finally {
+      flow("发送流程结束", { totalMs: Date.now() - flowT0 });
       assistantMsg.isStreaming = false;
       this.abortController = null;
       this.postState();

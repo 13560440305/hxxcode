@@ -1,12 +1,14 @@
 import * as vscode from "vscode";
 import * as fs from "fs/promises";
-import * as path from "path";
-import * as net from "net";
 import type { OpencodeClient } from "@opencode-ai/sdk";
 import { ProviderStore, buildOpencodeProviderConfig, envVarName } from "./providerStore";
-import { getOpencodeConfigPath } from "./storage";
+import { log, showDiag } from "./log";
+import { getOpencodeConfigPath, ensureOpencodeDirs, readJSON } from "./storage";
 
 // ── Stream event types ───────────────────────────────────────────────────────
+const TERMINAL_CHUNK_TYPES = new Set([
+  "session.next.step.failed",
+]);
 export type StreamEventType =
   | "text"          // AI 生成了一段文本增量
   | "tool_use"      // AI 请求调用工具（开始执行）
@@ -61,18 +63,24 @@ export class OpencodeManager implements vscode.Disposable {
     }
   }
 
+  private flow(step: string, detail?: unknown): void {
+    const msg = detail !== undefined ? `${step} ${typeof detail === "string" ? detail : JSON.stringify(detail)}` : step;
+    log("[flow/opencode]", msg);
+  }
+
   private async doStart(): Promise<void> {
+    this.flow("doStart 开始", { workspace: this.workspaceRoot });
     await this.writeOpencodeConfig();
-    const port = await findFreePort();
     const env = await this.buildEnv();
+    const envKeys = Object.keys(env).filter((k) => k.startsWith("OPENCODE_BRIDGE_"));
+    this.flow("buildEnv", { keys: envKeys, hasKeys: envKeys.length > 0 });
 
     const { createOpencode } = await import("@opencode-ai/sdk");
     this.server = await createOpencode({
-      hostname: "127.0.0.1",
-      port,
-      // OpenCode 会读取工作区下的 opencode.json，这里只需指定运行目录
       config: { cwd: this.workspaceRoot },
       env,
+      onStderr: (text) => log("[opencode/stderr]", text.trimEnd()),
+      onLog: (msg) => log("[opencode/sdk]", msg),
     });
     this.client = this.server.client;
 
@@ -80,6 +88,7 @@ export class OpencodeManager implements vscode.Disposable {
     if (!health.data.healthy) {
       throw new Error("HxxCode server 启动后健康检查未通过");
     }
+    this.flow("doStart 完成");
   }
 
   /** 供应商增删改后调用：重写配置文件并重启子进程 */
@@ -96,30 +105,81 @@ export class OpencodeManager implements vscode.Disposable {
     }
   }
 
-  getClient(): OpencodeClient {
+  /** 获取 client，如果尚未启动则自动尝试启动 */
+  private async ensureClient(): Promise<OpencodeClient> {
     if (!this.client) {
-      throw new Error("HxxCode server 尚未启动，请先调用 start()");
+      try {
+        await this.start();
+      } catch (err) {
+        throw new Error(
+          `无法启动 OpenCode Server：${(err as Error).message}\n\n` +
+            "请确保 @opencode-ai/cli 已安装且在 PATH 上（npm install -g @opencode-ai/cli），\n" +
+            "命令名为 lildax，然后在设置面板中配置供应商。"
+        );
+      }
+    }
+    if (!this.client) {
+      throw new Error(
+        "无法连接到 OpenCode Server。\n\n" +
+          "请确保 @opencode-ai/cli 已安装且在 PATH 上，然后在设置面板中配置供应商。\n" +
+          "安装方法：npm install -g @opencode-ai/cli"
+      );
     }
     return this.client;
   }
 
   /** 新建一次对话 session */
   async createSession(title: string) {
-    const client = this.getClient();
+    const client = await this.ensureClient();
     const { provider, model } = this.providerStore.getActive();
     if (!provider || !model) {
-      throw new Error("尚未配置可用的模型供应商，请先在设置面板中添加");
+      throw new Error("尚未配置可用的模型供应商，请先在设置面板中添加供应商和模型");
     }
-    const session = await client.session.create({ body: { title } });
+    const session = await client.session.create({
+      body: { title, model: `${provider.id}/${model}` },
+    });
+    if (!session.data?.id) {
+      throw new Error("OpenCode session 创建失败：未返回 session ID");
+    }
     return session.data;
+  }
+
+  /** OpenCode 2.0 的 session ID 以 ses_ 开头 */
+  isBackendSessionId(sessionId: string): boolean {
+    return sessionId.startsWith("ses_");
+  }
+
+  /**
+   * 确保 sessionId 对应 OpenCode 后端上存在的 session。
+   * 本地 shortId 或 server 重启后失效的 session 会重新创建。
+   */
+  async ensureBackendSession(sessionId: string, title?: string): Promise<string> {
+    this.flow("ensureBackendSession", { sessionId, title });
+    const client = await this.ensureClient();
+    if (
+      this.isBackendSessionId(sessionId) &&
+      client.session.get
+    ) {
+      const existing = await client.session.get(sessionId);
+      if (existing.data) {
+        this.flow("ensureBackendSession 复用", sessionId);
+        return sessionId;
+      }
+      this.flow("ensureBackendSession 后端 session 不存在，重建", sessionId);
+    } else {
+      this.flow("ensureBackendSession 本地 ID，需创建", sessionId);
+    }
+    const session = await this.createSession(title ?? "Chat");
+    this.flow("ensureBackendSession 新 session", session.id);
+    return session.id;
   }
 
   /** 发送一条 prompt，返回可迭代的流式响应（由调用方转发给 Webview 渲染） */
   async prompt(sessionId: string, text: string) {
-    const client = this.getClient();
+    const client = await this.ensureClient();
     const { provider, model } = this.providerStore.getActive();
     if (!provider || !model) {
-      throw new Error("尚未配置可用的模型供应商，请先在设置面板中添加");
+      throw new Error("尚未配置可用的模型供应商，请先在设置面板中添加供应商和模型");
     }
     return client.session.prompt({
       path: { id: sessionId },
@@ -131,8 +191,9 @@ export class OpencodeManager implements vscode.Disposable {
   }
 
   /**
-   * 流式发送 prompt：将 SDK 返回的流式事件（文本增量、工具调用、工具结果）转化为
-   * StreamEvent 回调，由调用方（chatViewProvider）转发给 Webview 渲染。
+   * 流式发送 prompt：通过 OpenCode Server 发送消息，接收流式事件
+   * （文本增量、工具调用、工具结果），转化为 StreamEvent 回调，
+   * 由调用方（chatViewProvider）转发给 Webview 渲染。
    * 支持 AbortSignal 取消。
    */
   async promptStream(
@@ -141,11 +202,18 @@ export class OpencodeManager implements vscode.Disposable {
     onEvent: (event: StreamEvent) => void,
     signal?: AbortSignal
   ): Promise<void> {
-    const client = this.getClient();
+    const t0 = Date.now();
+    const client = await this.ensureClient();
     const { provider, model } = this.providerStore.getActive();
     if (!provider || !model) {
       throw new Error("尚未配置可用的模型供应商，请先在设置面板中添加");
     }
+
+    this.flow("promptStream 开始", {
+      sessionId,
+      model: `${provider.id}/${model}`,
+      textLen: text.length,
+    });
 
     const result = await client.session.prompt({
       path: { id: sessionId },
@@ -155,87 +223,50 @@ export class OpencodeManager implements vscode.Disposable {
       },
     });
 
-    // 处理流式响应：适配 SDK 可能返回的多种流式形态
-    const stream = result as unknown;
-    if (stream && typeof stream === "object") {
-      // 形态 1：AsyncIterable<StreamChunk>
-      if (Symbol.asyncIterator in Object(stream)) {
-        for await (const chunk of stream as AsyncIterable<Record<string, unknown>>) {
-          if (signal?.aborted) break;
-          this.interpretChunk(chunk, onEvent);
+    const iterable = result as AsyncIterable<Record<string, unknown>>;
+    let finished = false;
+    let chunkCount = 0;
+    try {
+      for await (const chunk of iterable) {
+        chunkCount++;
+        if (signal?.aborted) {
+          this.flow("promptStream 已取消", { chunks: chunkCount });
+          break;
         }
-        if (!signal?.aborted) onEvent({ type: "finish" });
-        return;
-      }
-
-      // 形态 2：{ on(): ... } EventEmitter 风格（Node.js Stream / EventEmitter）
-      interface EventEmitterLike {
-        on(event: string, listener: (...args: unknown[]) => void): void;
-        removeListener(event: string, listener: (...args: unknown[]) => void): void;
-      }
-      if ("on" in stream && typeof (stream as Record<string, unknown>).on === "function") {
-        return new Promise<void>((resolve) => {
-          const emitter = stream as EventEmitterLike;
-          const onData = (chunk: unknown) => {
-            if (signal?.aborted) {
-              cleanup();
-              resolve();
-              return;
-            }
-            if (chunk && typeof chunk === "object") {
-              this.interpretChunk(chunk as Record<string, unknown>, onEvent);
-            }
-          };
-          const onEnd = () => {
-            cleanup();
-            onEvent({ type: "finish" });
-            resolve();
-          };
-          const onError = (...args: unknown[]) => {
-            cleanup();
-            const err = args[0];
-            onEvent({ type: "error", error: String(err) });
-            resolve();
-          };
-          const cleanup = () => {
-            emitter.removeListener("data", onData);
-            emitter.removeListener("end", onEnd);
-            emitter.removeListener("error", onError);
-          };
-          emitter.on("data", onData);
-          emitter.on("end", onEnd);
-          emitter.on("error", onError);
+        const chunkType = (chunk as Record<string, unknown>).type;
+        if (chunkCount <= 20 || TERMINAL_CHUNK_TYPES.has(String(chunkType))) {
+          this.flow(`promptStream chunk #${chunkCount}`, chunkType);
+        } else if (chunkCount === 21) {
+          this.flow("promptStream …后续 chunk 省略");
+        }
+        this.interpretChunk(chunk, (event) => {
+          if (event.type === "finish") finished = true;
+          onEvent(event);
         });
       }
-
-      // 形态 3：如果 SDK 直接返回完整响应（非流式），作为单块文本发出
-      const data = stream as Record<string, unknown>;
-      if (data.text && typeof data.text === "string") {
-        onEvent({ type: "text", text: data.text });
-        onEvent({ type: "finish" });
+    } catch (err) {
+      if (finished || this.isBenignStreamError(err)) {
+        this.flow("promptStream 结束 (benign)", { chunks: chunkCount, ms: Date.now() - t0 });
         return;
       }
-      if (data.content && Array.isArray(data.content)) {
-        for (const part of data.content) {
-          if (part.type === "text") {
-            onEvent({ type: "text", text: part.text });
-          }
-          if (part.type === "tool_use") {
-            onEvent({
-              type: "tool_use",
-              toolCallId: part.id ?? part.toolCallId,
-              toolName: part.name,
-              toolInput: part.input,
-            });
-          }
-        }
-        onEvent({ type: "finish" });
-        return;
-      }
+      this.flow("promptStream 错误", { err: String(err), chunks: chunkCount, ms: Date.now() - t0 });
+      onEvent({ type: "error", error: String(err) });
+      return;
     }
+    if (!signal?.aborted && !finished) onEvent({ type: "finish" });
+    this.flow("promptStream 完成", { chunks: chunkCount, finished, ms: Date.now() - t0 });
+  }
 
-    // 兜底：未知格式，至少通知完成
-    onEvent({ type: "finish" });
+  private isBenignStreamError(err: unknown): boolean {
+    if (!err || typeof err !== "object") return false;
+    if ((err as Error).name === "AbortError") return true;
+    const msg = String((err as Error).message ?? err);
+    return (
+      msg === "terminated" ||
+      msg.includes("terminated") ||
+      msg.includes("aborted") ||
+      msg.includes("The operation was aborted")
+    );
   }
 
   /**
@@ -244,6 +275,61 @@ export class OpencodeManager implements vscode.Disposable {
    */
   private interpretChunk(chunk: Record<string, unknown>, onEvent: (e: StreamEvent) => void): void {
     const type = chunk.type as string | undefined;
+
+    // OpenCode 2.0 SSE 事件（session.next.*）
+    if (type === "session.next.text.delta") {
+      const data = chunk.data as Record<string, unknown> | undefined;
+      const delta = (data?.delta ?? data?.text) as string | undefined;
+      if (delta) onEvent({ type: "text", text: delta });
+      return;
+    }
+    if (type === "session.next.text.ended") {
+      const data = chunk.data as Record<string, unknown> | undefined;
+      const text = data?.text as string | undefined;
+      if (text) onEvent({ type: "text", text });
+      return;
+    }
+    if (type === "session.next.step.failed") {
+      const data = chunk.data as Record<string, unknown> | undefined;
+      onEvent({
+        type: "error",
+        error: (data?.error ?? data?.message ?? "Agent 执行失败") as string,
+      });
+      onEvent({ type: "finish" });
+      return;
+    }
+    if (type === "session.next.tool.called") {
+      const data = chunk.data as Record<string, unknown> | undefined;
+      onEvent({
+        type: "tool_use",
+        toolCallId: (data?.callID ?? data?.id) as string,
+        toolName: (data?.tool ?? data?.name) as string,
+        toolInput: (data?.input ?? data?.arguments) as Record<string, unknown>,
+      });
+      return;
+    }
+    if (type === "session.next.tool.success" || type === "session.next.tool.failed") {
+      const data = chunk.data as Record<string, unknown> | undefined;
+      onEvent({
+        type: "tool_result",
+        toolCallId: (data?.callID ?? data?.id) as string,
+        toolName: (data?.tool ?? data?.name) as string,
+        toolResult:
+          data?.structured ?? data?.result ?? data?.output ?? data?.error,
+      });
+      return;
+    }
+    if (type === "session.next.step.ended") {
+      const data = chunk.data as Record<string, unknown> | undefined;
+      if (data?.finish === "stop" || data?.finish === "end_turn" || data?.finish === "stop-sequence") {
+        onEvent({ type: "finish" });
+      }
+      return;
+    }
+    if (type === "session.next.step.failed") {
+      onEvent({ type: "finish" });
+      return;
+    }
 
     if (type === "text" || type === "text_delta") {
       const delta = (chunk.delta ?? chunk.text ?? chunk.content) as string | undefined;
@@ -293,11 +379,25 @@ export class OpencodeManager implements vscode.Disposable {
   }
 
   private async writeOpencodeConfig(): Promise<void> {
-    const providerConfig = buildOpencodeProviderConfig(this.providerStore.list());
+    const apiKeys: Record<string, string> = {};
+    for (const p of this.providerStore.list()) {
+      const key = await this.providerStore.getApiKey(p.id);
+      if (key) apiKeys[p.id] = key;
+    }
+    const providerConfig = buildOpencodeProviderConfig(this.providerStore.list(), apiKeys);
     const configPath = getOpencodeConfigPath();
-    const content = JSON.stringify({ provider: providerConfig }, null, 2);
-    await fs.mkdir(path.dirname(configPath), { recursive: true });
-    await fs.writeFile(configPath, content, "utf-8");
+    const existing = await readJSON<Record<string, unknown>>(configPath, {});
+    const merged = {
+      ...existing,
+      $schema: existing.$schema ?? "https://opencode.ai/config.json",
+      provider: {
+        ...((existing.provider as Record<string, unknown>) ?? {}),
+        ...providerConfig,
+      },
+    };
+    await ensureOpencodeDirs();
+    await fs.writeFile(configPath, JSON.stringify(merged, null, 2), "utf-8");
+    this.flow("writeOpencodeConfig", { path: configPath, providers: Object.keys(providerConfig) });
   }
 
   private async buildEnv(): Promise<NodeJS.ProcessEnv> {
@@ -316,19 +416,3 @@ export class OpencodeManager implements vscode.Disposable {
   }
 }
 
-async function findFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.unref();
-    server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (address && typeof address === "object") {
-        const port = address.port;
-        server.close(() => resolve(port));
-      } else {
-        reject(new Error("无法分配端口"));
-      }
-    });
-  });
-}

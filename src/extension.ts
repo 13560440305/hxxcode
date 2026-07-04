@@ -62,11 +62,12 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // 启动后端（直连模式不需要 opencode CLI，有供应商配置即可工作）
+  // 启动 OpenCode Server（需要 opencode CLI 在 PATH 上）
   await opencodeManager.start().catch((err) => {
     const msg = (err as Error).message;
-    log("opencodeManager.start() 跳过:", msg);
-    // 没有供应商配置时静默跳过，用户去设置面板配好后会自动重连
+    log("opencodeManager.start() 失败:", msg);
+    // 启动失败时给用户一个可操作的提示，但扩展继续激活
+    // 用户发送第一条消息时会 triggers ensureClient() 的自动重试
   });
 
   log("数据目录:", getHxxCodeDir());

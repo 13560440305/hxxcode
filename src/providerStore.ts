@@ -36,7 +36,7 @@ const DEFAULT_STATE: ProviderState = {
 
 /**
  * 供应商配置持久化。
- * 主存储：~/.HxxCode/config.json
+ * 主存储：~/.hxxcode/config.json
  * 首次使用时会从 VS Code globalState + SecretStorage 迁移旧数据。
  */
 export class ProviderStore {
@@ -51,13 +51,13 @@ export class ProviderStore {
 
   /** 异步加载数据（必须在 create 后调用） */
   async load(): Promise<void> {
-    // 从 ~/.HxxCode/config.json 读取
+    // 从 ~/.hxxcode/config.json 读取
     const fileState = await readJSON<ProviderState | null>(this.configPath, null);
 
     if (fileState && fileState.providers && fileState.providers.length > 0) {
       // 文件存在且有数据
       this.state = { ...DEFAULT_STATE, ...fileState };
-      log("ProviderStore: 从 ~/.HxxCode/config.json 加载", fileState.providers.length, "个供应商");
+      log("ProviderStore: 从 ~/.hxxcode/config.json 加载", fileState.providers.length, "个供应商");
       return;
     }
 
@@ -185,7 +185,7 @@ export class ProviderStore {
 
   private async persist(): Promise<void> {
     await ensureDirs();
-    // 写 ~/.HxxCode/config.json
+    // 写 ~/.hxxcode/config.json
     await writeJSON(this.configPath, {
       providers: this.state.providers,
       activeProviderId: this.state.activeProviderId,
@@ -205,19 +205,28 @@ const npmForKind = (kind: ProviderKind, custom?: string): string => {
  * 把 ProviderStore 的状态翻译成 opencode.json 里的 provider 段。
  * apiKey 用环境变量占位，真正的值通过 env 注入。
  */
+function normalizeBaseURL(baseURL: string): string {
+  const trimmed = baseURL.replace(/\/+$/, "");
+  if (trimmed.endsWith("/v1")) return trimmed;
+  return `${trimmed}/v1`;
+}
+
 export function buildOpencodeProviderConfig(
-  providers: ProviderConfig[]
+  providers: ProviderConfig[],
+  apiKeys: Record<string, string> = {}
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const p of providers) {
     if (!p.baseURL) continue;
+    const apiKey = apiKeys[p.id] ?? `{env:${envVarName(p.id)}}`;
     result[p.id] = {
       npm: npmForKind(p.kind, p.npm),
+      name: p.name,
       options: {
-        baseURL: p.baseURL,
-        apiKey: `{env:${envVarName(p.id)}}`,
+        baseURL: normalizeBaseURL(p.baseURL),
+        apiKey,
       },
-      models: Object.fromEntries(p.models.map((m) => [m, {}])),
+      models: Object.fromEntries(p.models.map((m) => [m, { name: m }])),
     };
   }
   return result;
