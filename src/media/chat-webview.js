@@ -11,6 +11,14 @@
     const settingsBtn = $("settingsBtn");
     const providerSelect = $("providerSelect");
     const modelSelect = $("modelSelect");
+    const permissionPanel = $("permissionPanel");
+    const permissionTitle = $("permissionTitle");
+    const permissionDetail = $("permissionDetail");
+
+    const SEND_ICON =
+      '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>';
+    const STOP_ICON =
+      '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>';
 
     let state = {
       sessions: [],
@@ -22,37 +30,25 @@
       isStreaming: false,
     };
 
+    let pendingPermissionId = null;
+
+    const ACTION_LABELS = {
+      external_directory: "访问工作区外目录",
+      edit: "编辑文件",
+      write: "写入文件",
+      read: "读取文件",
+      bash: "执行命令",
+      glob: "搜索文件",
+      grep: "搜索内容",
+    };
+
     function updateState(newState) {
       state = { ...state, ...newState };
       renderSessions();
       renderProviders();
       renderMessages();
       updateInputState();
-      updateDebug();
     }
-
-    function updateDebug() {
-      const el = $("debugInfo");
-      if (!el) return;
-      el.style.display = "block";
-      el.textContent =
-        "sessions:" +
-        state.sessions.length +
-        " providers:" +
-        state.providers.length +
-        " msgs:" +
-        state.messages.length +
-        " activeSession:" +
-        (state.activeSessionId ? "yes" : "no") +
-        " activeProvider:" +
-        (state.activeProviderId || "none");
-    }
-
-    setTimeout(() => {
-      if (state.sessions.length === 0 || state.providers.length === 0) {
-        vscode.postMessage({ type: "requestState" });
-      }
-    }, 3000);
 
     function renderSessions() {
       if (!sessionSelect) return;
@@ -66,9 +62,7 @@
       const activeId = state.sessions.some((s) => s.id === state.activeSessionId)
         ? state.activeSessionId
         : state.sessions[0]?.id ?? null;
-      if (activeId) {
-        sessionSelect.value = activeId;
-      }
+      if (activeId) sessionSelect.value = activeId;
     }
 
     function renderProviders() {
@@ -80,9 +74,7 @@
         opt.textContent = p.name + (p.isDefault ? " ★" : "");
         providerSelect.appendChild(opt);
       }
-      if (state.activeProviderId) {
-        providerSelect.value = state.activeProviderId;
-      }
+      if (state.activeProviderId) providerSelect.value = state.activeProviderId;
       renderModels();
     }
 
@@ -115,26 +107,18 @@
         const div = document.createElement("div");
         div.className = "msg " + msg.role;
 
-        const label = document.createElement("div");
-        label.className = "msg-label";
-        label.textContent = msg.role === "user" ? "你" : "AI";
-        div.appendChild(label);
-
         const bubble = document.createElement("div");
         bubble.className = "bubble";
 
         if (msg.text) {
           const content = document.createElement("div");
           content.innerHTML = renderMarkdown(msg.text);
-          if (msg.isStreaming) {
-            content.classList.add("streaming-cursor");
-          }
+          if (msg.isStreaming) content.classList.add("streaming-cursor");
           bubble.appendChild(content);
         } else if (msg.isStreaming) {
           const cursor = document.createElement("span");
           cursor.className = "streaming-cursor";
           cursor.style.display = "inline-block";
-          cursor.style.padding = "8px 0";
           bubble.appendChild(cursor);
         }
 
@@ -146,29 +130,23 @@
         messagesEl.appendChild(div);
       }
 
-      if (wasAtBottom || state.messages.length === 0) {
-        scrollToBottom();
-      }
+      if (wasAtBottom || state.messages.length === 0) scrollToBottom();
     }
 
     function renderToolCard(tc) {
       const card = document.createElement("div");
       card.className = "tool-card";
-      card.dataset.toolId = tc.id;
 
       const header = document.createElement("div");
       header.className = "tool-card-header";
       header.innerHTML =
-        '<span class="icon">' +
-        (tc.isRunning ? "⏳" : "✅") +
-        "</span>" +
+        '<span class="chevron">▶</span>' +
         '<span class="name">' +
         escapeHtml(tc.name) +
         "</span>" +
         '<span class="status">' +
-        (tc.isRunning ? "执行中…" : "完成") +
+        (tc.isRunning ? "运行中…" : "完成") +
         "</span>";
-      card.appendChild(header);
 
       const body = document.createElement("div");
       body.className = "tool-card-body";
@@ -194,15 +172,38 @@
         body.appendChild(resPre);
       }
 
+      card.appendChild(header);
       card.appendChild(body);
 
-      let isOpen = false;
       header.addEventListener("click", () => {
-        isOpen = !isOpen;
-        body.classList.toggle("open", isOpen);
+        const open = body.classList.toggle("open");
+        header.classList.toggle("open", open);
       });
 
       return card;
+    }
+
+    function showPermissionRequest(payload) {
+      pendingPermissionId = payload.id;
+      const actionLabel = ACTION_LABELS[payload.action] || payload.action;
+      permissionTitle.textContent = "需要确认：" + actionLabel;
+      permissionDetail.textContent = (payload.resources || []).join("\n") || "未知范围";
+      permissionPanel?.classList.remove("hidden");
+      scrollToBottom();
+    }
+
+    function hidePermissionRequest() {
+      pendingPermissionId = null;
+      permissionPanel?.classList.add("hidden");
+    }
+
+    function replyPermission(reply) {
+      if (!pendingPermissionId) return;
+      vscode.postMessage({
+        type: "permissionReply",
+        payload: { id: pendingPermissionId, reply },
+      });
+      hidePermissionRequest();
     }
 
     function updateStreamingChunk(_sessionId, _chunk, accumulatedText) {
@@ -280,22 +281,32 @@
     }
 
     function isAtBottom() {
-      return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
+      return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 48;
     }
 
     function scrollToBottom() {
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
+    function autoResizeInput() {
+      if (!inputBox) return;
+      inputBox.style.height = "auto";
+      inputBox.style.height = Math.min(inputBox.scrollHeight, 140) + "px";
+    }
+
     function updateInputState() {
       if (!sendBtn || !inputBox) return;
-      sendBtn.textContent = state.isStreaming ? "取消" : "发送";
-      sendBtn.className = state.isStreaming ? "send-btn cancel" : "send-btn";
-      if (!state.isStreaming) {
+      if (state.isStreaming) {
+        sendBtn.innerHTML = STOP_ICON;
+        sendBtn.className = "send-btn cancel";
+        sendBtn.title = "取消";
+        inputBox.disabled = true;
+      } else {
+        sendBtn.innerHTML = SEND_ICON;
+        sendBtn.className = "send-btn";
+        sendBtn.title = "发送";
         inputBox.disabled = false;
         inputBox.focus();
-      } else {
-        inputBox.disabled = true;
       }
     }
 
@@ -306,9 +317,7 @@
       toast.className = "toast";
       toast.textContent = message;
       container.appendChild(toast);
-      setTimeout(() => {
-        toast.remove();
-      }, 5000);
+      setTimeout(() => toast.remove(), 5000);
     }
 
     function send() {
@@ -319,9 +328,15 @@
       const text = inputBox.value.trim();
       if (!text) return;
       inputBox.value = "";
-      inputBox.style.height = "auto";
+      autoResizeInput();
       vscode.postMessage({ type: "sendMessage", payload: { text } });
     }
+
+    permissionPanel?.querySelectorAll("[data-reply]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        replyPermission(btn.getAttribute("data-reply"));
+      });
+    });
 
     window.addEventListener("message", (event) => {
       const msg = event.data;
@@ -348,12 +363,16 @@
         case "toolEnd":
           updateToolEnd(msg.payload.sessionId, msg.payload.toolCallId, msg.payload.toolResult);
           break;
+        case "permissionRequest":
+          showPermissionRequest(msg.payload);
+          break;
         case "error":
           showToast(msg.payload.message);
           break;
       }
     });
 
+    inputBox?.addEventListener("input", autoResizeInput);
     inputBox?.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
@@ -384,20 +403,6 @@
         type: "switchModel",
         payload: { providerId: providerSelect.value, model: modelSelect.value },
       });
-    });
-    document.addEventListener("click", (e) => {
-      const btn = e.target.closest(".copy-btn");
-      if (btn) {
-        const code = btn.parentElement.querySelector("code");
-        if (code) {
-          navigator.clipboard.writeText(code.textContent).then(() => {
-            btn.textContent = "✓";
-            setTimeout(() => {
-              btn.textContent = "复制";
-            }, 1500);
-          });
-        }
-      }
     });
 
     const bootEl = document.getElementById("boot-state");

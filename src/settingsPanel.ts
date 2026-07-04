@@ -108,17 +108,31 @@ export class SettingsPanel {
         ChatViewProvider.notifyProviderChanged();
         break;
       }
+
+      case "setAgentBackend": {
+        const { backendId } = message.payload as { backendId: string };
+        await this.providerStore.setActiveAgentBackend(backendId);
+        await this.opencodeManager.restart();
+        vscode.window.showInformationMessage(
+          `已切换 Agent 后端为「${this.providerStore.getActiveAgentBackend().name}」`
+        );
+        this.postState();
+        break;
+      }
     }
   }
 
   private postState(): void {
     const { provider, model } = this.providerStore.getActive();
+    const activeAgent = this.providerStore.getActiveAgentBackend();
     this.panel.webview.postMessage({
       type: "state",
       payload: {
         providers: this.providerStore.list(),
         activeProviderId: provider?.id ?? null,
         activeModel: model,
+        agentBackends: this.providerStore.listAgentBackends(),
+        activeAgentBackendId: activeAgent.id,
       },
     });
   }
@@ -136,9 +150,22 @@ export class SettingsPanel {
   label { display: block; font-size: 12px; margin: 8px 0 4px; opacity: 0.8; }
   input, select { width: 100%; box-sizing: border-box; padding: 4px 6px; }
   button { margin-top: 8px; margin-right: 8px; }
+  .section { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--vscode-widget-border); }
+  .hint { font-size: 11px; opacity: 0.75; margin-top: 6px; line-height: 1.5; }
+  code { font-size: 11px; }
 </style>
 </head>
 <body>
+  <div class="section">
+    <h2>Agent 后端（CLI 插件）</h2>
+    <label>当前使用的 Agent CLI</label>
+    <select id="agentBackendSelect"></select>
+    <p class="hint">
+      默认使用官方 <code>@opencode-ai/cli</code>（命令 <code>lildax</code>）。
+      可在 <code>~/.hxxcode/config.json</code> 的 <code>agentBackend</code> 中注册定制 CLI 并切换。
+    </p>
+  </div>
+
   <h2>模型供应商</h2>
   <div id="providerList"></div>
 
@@ -168,10 +195,34 @@ export class SettingsPanel {
 
     window.addEventListener("message", (event) => {
       const { type, payload } = event.data;
-      if (type === "state") renderProviders(payload);
+      if (type === "state") renderState(payload);
       if (type === "modelsFetched") $("models").value = payload.models.join(", ");
       if (type === "error") alert(payload.message);
     });
+
+    function renderState(state) {
+      renderAgentBackends(state);
+      renderProviders(state);
+    }
+
+    function renderAgentBackends(state) {
+      const sel = $("agentBackendSelect");
+      if (!sel) return;
+      sel.innerHTML = "";
+      for (const b of state.agentBackends || []) {
+        const opt = document.createElement("option");
+        opt.value = b.id;
+        opt.textContent = b.name + " → " + b.command + (b.builtin ? "" : " (自定义)");
+        sel.appendChild(opt);
+      }
+      if (state.activeAgentBackendId) sel.value = state.activeAgentBackendId;
+      sel.onchange = () => {
+        vscode.postMessage({
+          type: "setAgentBackend",
+          payload: { backendId: sel.value },
+        });
+      };
+    }
 
     function renderProviders(state) {
       const list = $("providerList");

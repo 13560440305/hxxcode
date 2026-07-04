@@ -22,6 +22,7 @@ export async function activate(context: vscode.ExtensionContext) {
   log("ProviderStore 初始化完成");
   log("providers:", providerStore.list());
   log("active:", providerStore.getActive());
+  log("agent backend:", providerStore.getActiveAgentBackend());
 
   const opencodeManager = new OpencodeManager(context, providerStore, workspaceRoot);
   context.subscriptions.push(opencodeManager);

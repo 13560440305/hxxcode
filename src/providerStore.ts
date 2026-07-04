@@ -1,6 +1,15 @@
 import * as vscode from "vscode";
 import { readJSON, writeJSON, getConfigPath, ensureDirs } from "./storage";
 import { log } from "./log";
+import {
+  type AgentBackendCustom,
+  type AgentBackendDefinition,
+  type AgentBackendSettings,
+  defaultAgentBackendSettings,
+  listAgentBackends,
+  normalizeAgentBackendSettings,
+  resolveActiveAgentBackend,
+} from "./agentBackend";
 
 export type ProviderKind = "openai-compatible" | "anthropic-compatible" | "custom";
 
@@ -21,6 +30,8 @@ interface ProviderState {
   activeModel: string | null;
   /** API Key 按 provider.id 存储 */
   apiKeys: Record<string, string>;
+  /** Agent CLI 后端（默认 @opencode-ai/cli） */
+  agentBackend: AgentBackendSettings;
 }
 
 const STATE_KEY = "opencodeBridge.providerState";
@@ -32,6 +43,7 @@ const DEFAULT_STATE: ProviderState = {
   activeProviderId: null,
   activeModel: null,
   apiKeys: {},
+  agentBackend: defaultAgentBackendSettings(),
 };
 
 /**
@@ -56,8 +68,16 @@ export class ProviderStore {
 
     if (fileState && fileState.providers && fileState.providers.length > 0) {
       // 文件存在且有数据
-      this.state = { ...DEFAULT_STATE, ...fileState };
+      this.state = {
+        ...DEFAULT_STATE,
+        ...fileState,
+        agentBackend: normalizeAgentBackendSettings(fileState.agentBackend),
+      };
       log("ProviderStore: 从 ~/.hxxcode/config.json 加载", fileState.providers.length, "个供应商");
+      log(
+        "ProviderStore: Agent 后端",
+        resolveActiveAgentBackend(this.state.agentBackend).id
+      );
       return;
     }
 
@@ -75,6 +95,7 @@ export class ProviderStore {
         activeProviderId: oldState.activeProviderId,
         activeModel: oldState.activeModel,
         apiKeys,
+        agentBackend: defaultAgentBackendSettings(),
       };
       await this.persist();
       log("ProviderStore: 从 VS Code 迁移旧数据完成", oldState.providers.length, "个供应商");
@@ -107,6 +128,46 @@ export class ProviderStore {
 
   list(): ProviderConfig[] {
     return this.state.providers;
+  }
+
+  // ── Agent 后端（CLI 插件）────────────────────────────────────────────────
+
+  getAgentBackendSettings(): AgentBackendSettings {
+    return this.state.agentBackend;
+  }
+
+  getActiveAgentBackend(): AgentBackendDefinition {
+    return resolveActiveAgentBackend(this.state.agentBackend);
+  }
+
+  listAgentBackends(): AgentBackendDefinition[] {
+    return listAgentBackends(this.state.agentBackend);
+  }
+
+  async setActiveAgentBackend(backendId: string): Promise<void> {
+    const available = this.listAgentBackends();
+    if (!available.some((b) => b.id === backendId)) {
+      throw new Error(`未知的 Agent 后端：${backendId}`);
+    }
+    this.state.agentBackend = {
+      ...this.state.agentBackend,
+      activeId: backendId,
+    };
+    await this.persist();
+    log("ProviderStore: 切换 Agent 后端 →", backendId);
+  }
+
+  /** 注册或更新用户自定义 Agent 后端（写入 config.json agentBackend.custom） */
+  async upsertCustomAgentBackend(id: string, config: AgentBackendCustom): Promise<void> {
+    this.state.agentBackend = {
+      ...this.state.agentBackend,
+      custom: {
+        ...(this.state.agentBackend.custom ?? {}),
+        [id]: config,
+      },
+    };
+    await this.persist();
+    log("ProviderStore: 注册自定义 Agent 后端", id);
   }
 
   get(id: string): ProviderConfig | undefined {
@@ -191,6 +252,7 @@ export class ProviderStore {
       activeProviderId: this.state.activeProviderId,
       activeModel: this.state.activeModel,
       apiKeys: this.state.apiKeys,
+      agentBackend: this.state.agentBackend,
     });
   }
 }

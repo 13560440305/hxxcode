@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as fs from "fs/promises";
-import type { OpencodeClient } from "@opencode-ai/sdk";
+import type { OpencodeClient, PermissionReply, PermissionRequest } from "@opencode-ai/sdk";
 import { ProviderStore, buildOpencodeProviderConfig, envVarName } from "./providerStore";
 import { log, showDiag } from "./log";
 import { getOpencodeConfigPath, ensureOpencodeDirs, readJSON } from "./storage";
@@ -45,6 +45,9 @@ export class OpencodeManager implements vscode.Disposable {
     null;
   private client: OpencodeClient | null = null;
   private starting: Promise<void> | null = null;
+  private permissionHandler:
+    | ((request: PermissionRequest) => Promise<PermissionReply>)
+    | null = null;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -69,7 +72,12 @@ export class OpencodeManager implements vscode.Disposable {
   }
 
   private async doStart(): Promise<void> {
-    this.flow("doStart 开始", { workspace: this.workspaceRoot });
+    const agentBackend = this.providerStore.getActiveAgentBackend();
+    this.flow("doStart 开始", {
+      workspace: this.workspaceRoot,
+      agentBackend: agentBackend.id,
+      cli: agentBackend.command,
+    });
     await this.writeOpencodeConfig();
     const env = await this.buildEnv();
     const envKeys = Object.keys(env).filter((k) => k.startsWith("OPENCODE_BRIDGE_"));
@@ -79,8 +87,11 @@ export class OpencodeManager implements vscode.Disposable {
     this.server = await createOpencode({
       config: { cwd: this.workspaceRoot },
       env,
+      cli: agentBackend.command,
+      cliPackage: agentBackend.npmPackage,
       onStderr: (text) => log("[opencode/stderr]", text.trimEnd()),
       onLog: (msg) => log("[opencode/sdk]", msg),
+      onPermission: (request) => this.handlePermissionRequest(request),
     });
     this.client = this.server.client;
 
@@ -107,22 +118,27 @@ export class OpencodeManager implements vscode.Disposable {
 
   /** 获取 client，如果尚未启动则自动尝试启动 */
   private async ensureClient(): Promise<OpencodeClient> {
+    const backend = this.providerStore.getActiveAgentBackend();
     if (!this.client) {
       try {
         await this.start();
       } catch (err) {
+        const installHint = backend.npmPackage
+          ? `npm install -g ${backend.npmPackage}`
+          : "请确保 CLI 在 PATH 上";
         throw new Error(
-          `无法启动 OpenCode Server：${(err as Error).message}\n\n` +
-            "请确保 @opencode-ai/cli 已安装且在 PATH 上（npm install -g @opencode-ai/cli），\n" +
-            "命令名为 lildax，然后在设置面板中配置供应商。"
+          `无法启动 Agent 后端「${backend.name}」：${(err as Error).message}\n\n` +
+            `当前 CLI 命令：${backend.command}\n` +
+            `安装/配置：${installHint}\n` +
+            `可在 ~/.hxxcode/config.json 的 agentBackend 中切换后端。`
         );
       }
     }
     if (!this.client) {
       throw new Error(
-        "无法连接到 OpenCode Server。\n\n" +
-          "请确保 @opencode-ai/cli 已安装且在 PATH 上，然后在设置面板中配置供应商。\n" +
-          "安装方法：npm install -g @opencode-ai/cli"
+        `无法连接到 Agent 后端「${backend.name}」。\n\n` +
+          `当前 CLI：${backend.command}\n` +
+          `请在设置面板或 ~/.hxxcode/config.json 中检查 agentBackend 配置。`
       );
     }
     return this.client;
@@ -255,6 +271,45 @@ export class OpencodeManager implements vscode.Disposable {
     }
     if (!signal?.aborted && !finished) onEvent({ type: "finish" });
     this.flow("promptStream 完成", { chunks: chunkCount, finished, ms: Date.now() - t0 });
+  }
+
+  /** 由 ChatViewProvider 注册：在侧栏 Webview 内展示权限确认 */
+  setPermissionHandler(
+    handler: (request: PermissionRequest) => Promise<PermissionReply>
+  ): void {
+    this.permissionHandler = handler;
+  }
+
+  private async handlePermissionRequest(
+    request: PermissionRequest
+  ): Promise<PermissionReply> {
+    if (this.permissionHandler) {
+      const reply = await this.permissionHandler(request);
+      this.flow("permission", { action: request.action, resources: request.resources, reply });
+      return reply;
+    }
+
+    const action = request.action ?? "unknown";
+    const resources = (request.resources ?? []).join(", ") || "未知范围";
+    const choice = await vscode.window.showQuickPick(
+      [
+        { label: "$(check) 允许一次", description: "仅批准本次操作", value: "once" as const },
+        {
+          label: "$(check-all) 始终允许",
+          description: "本次 OpenCode 会话内不再询问相同范围",
+          value: "always" as const,
+        },
+        { label: "$(close) 拒绝", description: "取消此操作", value: "reject" as const },
+      ],
+      {
+        title: `HxxCode 需要确认: ${action}`,
+        placeHolder: resources,
+        ignoreFocusOut: true,
+      }
+    );
+    const reply = choice?.value ?? "reject";
+    this.flow("permission", { action, resources: request.resources, reply });
+    return reply;
   }
 
   private isBenignStreamError(err: unknown): boolean {

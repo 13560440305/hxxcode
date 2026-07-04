@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs/promises";
 import { OpencodeManager, StreamEvent } from "./opencodeManager";
+import type { PermissionReply, PermissionRequest } from "@opencode-ai/sdk";
 import { ProviderStore, ProviderConfig } from "./providerStore";
 import { log, showDiag } from "./log";
 import { getSessionsDir, getSessionPath, ensureDirs, readJSON } from "./storage";
@@ -44,7 +45,8 @@ type WebviewMessage =
   | { type: "deleteSession"; payload: { sessionId: string } }
   | { type: "retryLastMessage" }
   | { type: "openSettings" }
-  | { type: "requestState" };
+  | { type: "requestState" }
+  | { type: "permissionReply"; payload: { id: string; reply: PermissionReply } };
 
 // ── Markdown 渲染器（极简实现，无外部依赖） ──────────────────────────────────
 
@@ -133,6 +135,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private abortController: AbortController | null = null;
   private sessionsLoaded = false;
   private webviewReady = false;
+  private pendingPermissionResolve: ((reply: PermissionReply) => void) | null = null;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -140,6 +143,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly providerStore: ProviderStore
   ) {
     ChatViewProvider._instance = this;
+    this.opencodeManager.setPermissionHandler((req) => this.requestPermissionInWebview(req));
   }
 
   resolveWebviewView(
@@ -319,7 +323,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "requestState":
         this.postState();
         break;
+
+      case "permissionReply":
+        if (this.pendingPermissionResolve) {
+          this.pendingPermissionResolve(msg.payload.reply);
+          this.pendingPermissionResolve = null;
+        }
+        break;
     }
+  }
+
+  /** OpenCode 工具权限确认 —— 在侧栏 Webview 内展示，而非顶部 QuickPick */
+  requestPermissionInWebview(request: PermissionRequest): Promise<PermissionReply> {
+    return new Promise((resolve) => {
+      this.pendingPermissionResolve = resolve;
+      void this._view?.show?.(true);
+      this.postMessage({
+        type: "permissionRequest",
+        payload: {
+          id: request.id,
+          action: request.action ?? "unknown",
+          resources: request.resources ?? [],
+        },
+      });
+    });
   }
 
   // ── 会话管理 ──────────────────────────────────────────────────────────────
@@ -722,20 +749,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   :root {
     --bg: var(--vscode-sideBar-background, #1e1e1e);
     --fg: var(--vscode-sideBar-foreground, #cccccc);
-    --border: var(--vscode-widget-border, #444444);
-    --input-bg: var(--vscode-input-background, #3c3c3c);
+    --muted: var(--vscode-descriptionForeground, #9d9d9d);
+    --border: var(--vscode-widget-border, #3c3c3c);
+    --input-bg: var(--vscode-input-background, #2b2b2b);
     --input-fg: var(--vscode-input-foreground, #cccccc);
-    --input-border: var(--vscode-input-border, #555555);
-    --badge-bg: var(--vscode-badge-background, #4d4d4d);
+    --input-border: var(--vscode-input-border, #3c3c3c);
+    --surface: var(--vscode-editor-background, #1e1e1e);
+    --surface-hover: var(--vscode-list-hoverBackground, rgba(255,255,255,0.04));
+    --accent: var(--vscode-button-background, #0e639c);
+    --accent-fg: var(--vscode-button-foreground, #ffffff);
+    --accent-hover: var(--vscode-button-hoverBackground, #1177bb);
+    --user-bg: var(--vscode-input-background, #2a2a2a);
+    --assistant-bg: transparent;
     --link-fg: var(--vscode-textLink-foreground, #3794ff);
     --code-bg: var(--vscode-textCodeBlock-background, #2d2d2d);
-    --btn-bg: var(--vscode-button-background, #0e639c);
-    --btn-fg: var(--vscode-button-foreground, #ffffff);
-    --btn-hover: var(--vscode-button-hoverBackground, #1177bb);
     --font: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
-    --mono-font: var(--vscode-editor-font-family, "Cascadia Code", "Fira Code", "JetBrains Mono", monospace);
-    --radius: 6px;
-    --msg-max-width: 90%;
+    --mono-font: var(--vscode-editor-font-family, "Cascadia Code", "Fira Code", monospace);
+    --radius: 10px;
+    --radius-sm: 6px;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -750,344 +781,355 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     overflow: hidden;
   }
 
-  /* ── Header ─────────────────────────────────── */
-  .header {
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    flex-shrink: 0;
-  }
-  .header-row {
+  /* ── Toolbar ── */
+  .toolbar {
     display: flex;
     align-items: center;
     gap: 6px;
-  }
-  .header-row select {
-    flex: 1;
-    background: var(--input-bg);
-    color: var(--input-fg);
-    border: 1px solid var(--input-border);
-    border-radius: var(--radius);
-    padding: 3px 6px;
-    font-size: 12px;
-    cursor: pointer;
-    -webkit-appearance: menulist;
-    appearance: menulist;
-  }
-  .header-row select option {
-    color: var(--vscode-foreground, #cccccc);
-    background: var(--vscode-dropdown-background, #3c3c3c);
-  }
-  .header-row button {
-    background: none;
-    border: 1px solid var(--border);
-    color: var(--fg);
-    border-radius: var(--radius);
-    padding: 3px 8px;
-    font-size: 12px;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .header-row button:hover {
-    background: var(--badge-bg);
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
   }
   .session-select {
+    flex: 1;
     min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    padding: 4px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
   }
+  .session-select:hover { background: var(--surface-hover); }
+  .session-select option {
+    color: var(--vscode-foreground, #ccc);
+    background: var(--vscode-dropdown-background, #3c3c3c);
+  }
+  .icon-btn {
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--fg);
+    cursor: pointer;
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+  .icon-btn:hover { background: var(--surface-hover); }
 
-  /* ── Messages ────────────────────────────────── */
+  /* ── Messages ── */
   .messages {
     flex: 1;
     overflow-y: auto;
-    padding: 12px 10px;
+    padding: 16px 12px;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 16px;
   }
   .messages:empty::after {
-    content: "输入消息开始与 AI 对话…";
+    content: "有什么可以帮你的？";
     display: block;
     text-align: center;
-    color: var(--border);
-    font-size: 13px;
-    margin-top: 40px;
-    opacity: 0.7;
+    color: var(--muted);
+    font-size: 14px;
+    margin-top: 48px;
   }
 
-  .msg {
-    max-width: var(--msg-max-width);
-    line-height: 1.55;
-    animation: fadeIn 0.15s ease;
-  }
-  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .msg { animation: fadeIn 0.2s ease; line-height: 1.6; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
   .msg.user {
     align-self: flex-end;
+    max-width: 88%;
   }
   .msg.user .bubble {
-    background: var(--btn-bg);
-    color: var(--btn-fg);
-    border-radius: 12px 12px 4px 12px;
-    padding: 8px 14px;
-    word-break: break-word;
-  }
-
-  .msg.assistant {
-    align-self: flex-start;
-    width: 100%;
-  }
-  .msg.assistant .bubble {
-    background: var(--code-bg);
-    border-radius: 12px 12px 12px 4px;
+    background: var(--user-bg);
+    border: 1px solid var(--border);
+    border-radius: 14px 14px 4px 14px;
     padding: 10px 14px;
     word-break: break-word;
   }
 
-  .msg-label {
-    font-size: 11px;
-    opacity: 0.6;
-    margin-bottom: 4px;
-    padding: 0 4px;
+  .msg.assistant {
+    align-self: stretch;
+    width: 100%;
   }
-  .msg.user .msg-label { text-align: right; }
+  .msg.assistant .bubble {
+    background: var(--assistant-bg);
+    padding: 2px 2px;
+    word-break: break-word;
+  }
 
-  /* ── Content styling ─────────────────────────── */
-  .bubble p { margin: 4px 0; }
+  .bubble p { margin: 6px 0; }
   .bubble p:first-child { margin-top: 0; }
   .bubble p:last-child { margin-bottom: 0; }
   .bubble code {
     font-family: var(--mono-font);
     font-size: 12px;
-    background: rgba(255,255,255,0.1);
-    padding: 1px 5px;
-    border-radius: 3px;
+    background: rgba(127,127,127,0.15);
+    padding: 2px 6px;
+    border-radius: 4px;
   }
-  .bubble pre {
-    margin: 8px 0;
-    position: relative;
-  }
+  .bubble pre { margin: 10px 0; position: relative; }
   .bubble pre code {
     display: block;
-    padding: 10px 12px;
+    padding: 12px 14px;
     overflow-x: auto;
-    background: rgba(0,0,0,0.3);
-    border-radius: var(--radius);
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
     font-size: 12px;
     line-height: 1.45;
-    white-space: pre;
-    word-break: normal;
   }
-  .bubble pre .copy-btn {
-    position: absolute;
-    top: 4px;
-    right: 4px;
-    background: rgba(255,255,255,0.1);
-    border: none;
-    color: var(--fg);
-    font-size: 11px;
-    padding: 2px 6px;
-    border-radius: 3px;
-    cursor: pointer;
-    opacity: 0;
-    transition: opacity 0.15s;
-  }
-  .bubble pre:hover .copy-btn { opacity: 1; }
-  .bubble pre .copy-btn:hover { background: rgba(255,255,255,0.2); }
   .bubble a { color: var(--link-fg); }
-  .bubble ul { padding-left: 20px; margin: 4px 0; }
-  .bubble li { margin: 2px 0; }
-  .bubble strong { font-weight: 600; }
-  .bubble em { font-style: italic; }
+  .bubble ul { padding-left: 20px; margin: 6px 0; }
 
-  /* ── Streaming cursor ────────────────────────── */
   .streaming-cursor::after {
     content: "▍";
-    display: inline-block;
     animation: blink 0.8s step-end infinite;
     color: var(--link-fg);
   }
   @keyframes blink { 50% { opacity: 0; } }
 
-  /* ── Tool call card ──────────────────────────── */
+  /* ── Tool cards (compact) ── */
   .tool-card {
-    margin: 8px 0 4px 0;
+    margin: 6px 0;
     border: 1px solid var(--border);
-    border-radius: var(--radius);
+    border-radius: var(--radius-sm);
     overflow: hidden;
+    background: var(--surface-hover);
   }
   .tool-card-header {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     padding: 6px 10px;
     cursor: pointer;
     user-select: none;
     font-size: 12px;
-    background: rgba(255,255,255,0.03);
   }
-  .tool-card-header:hover {
-    background: rgba(255,255,255,0.06);
+  .tool-card-header:hover { background: rgba(127,127,127,0.08); }
+  .tool-card-header .chevron {
+    font-size: 10px;
+    opacity: 0.6;
+    transition: transform 0.15s;
   }
-  .tool-card-header .icon {
-    font-size: 14px;
-    flex-shrink: 0;
-  }
+  .tool-card-header.open .chevron { transform: rotate(90deg); }
   .tool-card-header .name {
-    font-weight: 600;
     font-family: var(--mono-font);
-    font-size: 12px;
+    font-size: 11px;
+    opacity: 0.9;
   }
   .tool-card-header .status {
     margin-left: auto;
     font-size: 11px;
-    opacity: 0.7;
+    color: var(--muted);
   }
   .tool-card-body {
-    padding: 8px 12px;
-    font-family: var(--mono-font);
-    font-size: 12px;
-    border-top: 1px solid var(--border);
     display: none;
-    max-height: 300px;
+    padding: 8px 10px 10px;
+    border-top: 1px solid var(--border);
+    font-family: var(--mono-font);
+    font-size: 11px;
+    max-height: 200px;
     overflow: auto;
   }
   .tool-card-body.open { display: block; }
-  .tool-card-body pre {
-    white-space: pre-wrap;
-    word-break: break-all;
-    line-height: 1.4;
-  }
+  .tool-card-body pre { white-space: pre-wrap; word-break: break-all; line-height: 1.4; }
   .tool-card-body .label {
     font-family: var(--font);
-    font-size: 11px;
-    opacity: 0.6;
+    font-size: 10px;
+    color: var(--muted);
     margin: 6px 0 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
-  .tool-card-body .label:first-child { margin-top: 0; }
 
-  /* ── Input area ──────────────────────────────── */
-  .input-area {
-    padding: 10px 14px 12px;
-    border-top: 1px solid var(--border);
+  /* ── Permission panel ── */
+  .permission-panel {
+    margin: 0 10px 8px;
+    padding: 12px 14px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg));
     flex-shrink: 0;
+  }
+  .permission-panel.hidden { display: none; }
+  .permission-title {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  .permission-detail {
+    font-size: 12px;
+    color: var(--muted);
+    font-family: var(--mono-font);
+    word-break: break-all;
+    margin-bottom: 10px;
+    line-height: 1.5;
+  }
+  .permission-actions {
     display: flex;
     gap: 8px;
-    align-items: flex-end;
+    flex-wrap: wrap;
+  }
+  .permission-actions button {
+    flex: 1;
+    min-width: 80px;
+    padding: 6px 10px;
+    border-radius: var(--radius-sm);
+    border: none;
+    background: var(--accent);
+    color: var(--accent-fg);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .permission-actions button:hover { background: var(--accent-hover); }
+  .permission-actions button.secondary {
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid var(--border);
+  }
+  .permission-actions button.secondary:hover { background: var(--surface-hover); }
+
+  /* ── Composer ── */
+  .composer {
+    flex-shrink: 0;
+    padding: 8px 10px 10px;
+    border-top: 1px solid var(--border);
     background: var(--bg);
   }
-  .input-area textarea {
+  .composer-meta {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+  .chip-select {
     flex: 1;
+    min-width: 0;
+    background: var(--surface-hover);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .chip-select option {
+    color: var(--vscode-foreground, #ccc);
+    background: var(--vscode-dropdown-background, #3c3c3c);
+  }
+  .composer-box {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
     background: var(--input-bg);
-    color: var(--input-fg);
     border: 1px solid var(--input-border);
-    border-radius: 8px;
-    padding: 10px 12px;
+    border-radius: var(--radius);
+    padding: 8px 8px 8px 12px;
+    transition: border-color 0.15s;
+  }
+  .composer-box:focus-within {
+    border-color: var(--accent);
+  }
+  .composer-box textarea {
+    flex: 1;
+    background: transparent;
+    color: var(--input-fg);
+    border: none;
+    outline: none;
     font-family: var(--font);
     font-size: 13px;
     resize: none;
-    outline: none;
-    min-height: 42px;
-    max-height: 150px;
+    min-height: 22px;
+    max-height: 140px;
     line-height: 1.5;
-    overflow-y: auto;
   }
-  .input-area textarea:focus {
-    border-color: var(--btn-bg);
-  }
-  .input-area textarea::placeholder {
-    color: var(--input-fg);
-    opacity: 0.4;
-  }
-  .input-area .send-btn {
-    background: var(--btn-bg);
-    color: var(--btn-fg);
+  .composer-box textarea::placeholder { color: var(--muted); }
+  .send-btn {
+    width: 32px;
+    height: 32px;
     border: none;
     border-radius: 8px;
-    padding: 0 18px;
-    font-size: 13px;
-    font-weight: 500;
+    background: var(--accent);
+    color: var(--accent-fg);
     cursor: pointer;
-    white-space: nowrap;
-    height: 42px;
-    min-width: 60px;
-    transition: background 0.15s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: background 0.15s, opacity 0.15s;
   }
-  .input-area .send-btn:hover:not(:disabled) {
-    background: var(--btn-hover);
-  }
-  .input-area .send-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-  .input-area .send-btn.cancel {
+  .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
+  .send-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .send-btn.cancel {
     background: transparent;
-    border: 1px solid var(--border);
     color: var(--fg);
+    border: 1px solid var(--border);
   }
-  .input-area .send-btn.cancel:hover {
-    background: rgba(255,255,255,0.1);
-  }
+  .send-btn.cancel:hover { background: var(--surface-hover); }
 
-  /* ── Error toast ─────────────────────────────── */
   .toast-container {
     position: fixed;
-    top: 8px;
+    bottom: 72px;
     left: 50%;
     transform: translateX(-50%);
     z-index: 999;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
     pointer-events: none;
   }
   .toast {
     background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
     border: 1px solid var(--vscode-inputValidation-errorBorder, #be1100);
     color: var(--vscode-inputValidation-errorForeground, #ffeaea);
-    padding: 6px 14px;
-    border-radius: var(--radius);
+    padding: 8px 14px;
+    border-radius: var(--radius-sm);
     font-size: 12px;
-    pointer-events: auto;
-    animation: slideDown 0.2s ease;
+    animation: slideUp 0.2s ease;
     max-width: 90vw;
-    word-break: break-word;
   }
-  @keyframes slideDown { from { transform: translateY(-20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  @keyframes slideUp { from { transform: translateY(8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 </style>
 </head>
 <body>
 
-  <!-- Header -->
-  <div class="header">
-    <div class="header-row">
-      <select class="session-select" id="sessionSelect">${selects.sessions}</select>
-      <button id="newSessionBtn" title="新建会话">+</button>
-      <button id="settingsBtn" title="供应商设置">⚙️</button>
-    </div>
-    <div class="header-row">
-      <select id="providerSelect" style="flex:1">${selects.providers}</select>
-      <select id="modelSelect" style="flex:1">${selects.models}</select>
-    </div>
+  <div class="toolbar">
+    <select class="session-select" id="sessionSelect">${selects.sessions}</select>
+    <button class="icon-btn" id="newSessionBtn" title="新建会话">+</button>
+    <button class="icon-btn" id="settingsBtn" title="供应商设置">⚙</button>
   </div>
 
-  <!-- Messages -->
   <div class="messages" id="messagesContainer"></div>
 
-  <!-- Input -->
-  <div class="input-area">
-    <textarea id="inputBox" placeholder="输入消息…" rows="2"></textarea>
-    <button class="send-btn" id="sendBtn">发送</button>
+  <div class="permission-panel hidden" id="permissionPanel">
+    <div class="permission-title" id="permissionTitle">需要您的确认</div>
+    <div class="permission-detail" id="permissionDetail"></div>
+    <div class="permission-actions">
+      <button type="button" data-reply="once">允许一次</button>
+      <button type="button" data-reply="always">始终允许</button>
+      <button type="button" data-reply="reject" class="secondary">拒绝</button>
+    </div>
   </div>
 
-  <!-- Toast -->
-  <div class="toast-container" id="toastContainer"></div>
+  <div class="composer">
+    <div class="composer-meta">
+      <select id="providerSelect" class="chip-select">${selects.providers}</select>
+      <select id="modelSelect" class="chip-select">${selects.models}</select>
+    </div>
+    <div class="composer-box">
+      <textarea id="inputBox" placeholder="输入消息，Enter 发送，Shift+Enter 换行" rows="1"></textarea>
+      <button class="send-btn" id="sendBtn" title="发送" aria-label="发送">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>
+      </button>
+    </div>
+  </div>
 
-  <!-- Debug -->
-  <div id="debugInfo" style="padding:4px 10px;font-size:10px;opacity:0.4;border-top:1px solid var(--border);display:none"></div>
+  <div class="toast-container" id="toastContainer"></div>
 
 <script type="application/json" id="boot-state">${bootJson}</script>
 <script src="${scriptUri}"></script>
