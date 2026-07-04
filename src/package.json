@@ -3,6 +3,7 @@
   "displayName": "HxxCode",
   "description": "在 VS Code 中通过 HxxCode 运行 AI 编码 Agent，模型请求经 NewAPI 网关聚合，支持自由配置供应商",
   "version": "0.1.0",
+  "icon": "media/logo.png",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -69,9 +70,9 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
-    "package": "vsce package"
+    "build": "esbuild ./extension.ts --bundle --external:vscode --outfile=out/extension.js --platform=node --target=node20 --format=cjs --sourcemap=inline",
+    "watch": "esbuild ./extension.ts --bundle --external:vscode --outfile=out/extension.js --platform=node --target=node20 --format=cjs --sourcemap=inline --watch",
+    "package": "npm run build && npx @vscode/vsce package --allow-missing-repository --no-dependencies"
   },
   "dependencies": {
     "@opencode-ai/sdk": "file:lib/@opencode-ai/sdk"
@@ -79,6 +80,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.90.0",
+    "esbuild": "^0.28.1",
     "typescript": "^5.5.0"
   }
 }
