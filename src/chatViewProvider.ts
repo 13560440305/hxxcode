@@ -179,7 +179,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void this.initWebview(webviewView);
   }
 
-  /** 先加载会话数据，再渲染 webview（内嵌 state 才有完整下拉选项） */
+  /** 先加载会话数据，再渲染 webview（内嵌 boot state） */
   private async initWebview(webviewView: vscode.WebviewView): Promise<void> {
     this.webviewReady = false;
 
@@ -698,36 +698,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // ── Webview HTML ──────────────────────────────────────────────────────────
 
-  private renderSelectOptionsHtml(
-    state: ReturnType<ChatViewProvider["buildStatePayload"]>
-  ): { sessions: string; providers: string; models: string } {
-    const sessions = state.sessions
-      .map((s) => {
-        const selected = s.id === state.activeSessionId ? " selected" : "";
-        return `<option value="${escapeHtml(s.id)}"${selected}>${escapeHtml(s.title)}</option>`;
-      })
-      .join("");
-
-    const providers = state.providers
-      .map((p) => {
-        const selected = p.id === state.activeProviderId ? " selected" : "";
-        const star = p.isDefault ? " ★" : "";
-        return `<option value="${escapeHtml(p.id)}"${selected}>${escapeHtml(p.name)}${star}</option>`;
-      })
-      .join("");
-
-    const activeProvider =
-      state.providers.find((p) => p.id === state.activeProviderId) ?? state.providers[0];
-    const models = (activeProvider?.models ?? [])
-      .map((m) => {
-        const selected = m === state.activeModel ? " selected" : "";
-        return `<option value="${escapeHtml(m)}"${selected}>${escapeHtml(m)}</option>`;
-      })
-      .join("");
-
-    return { sessions, providers, models };
-  }
-
   private renderHtml(
     webview: vscode.Webview,
     initialState: ReturnType<ChatViewProvider["buildStatePayload"]>
@@ -737,7 +707,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     const cspSource = webview.cspSource;
     const bootJson = JSON.stringify(initialState).replace(/</g, "\\u003c");
-    const selects = this.renderSelectOptionsHtml(initialState);
 
     return /* html */ `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -751,24 +720,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     --fg: var(--vscode-sideBar-foreground, #cccccc);
     --muted: var(--vscode-descriptionForeground, #9d9d9d);
     --border: var(--vscode-widget-border, #3c3c3c);
+    --border-subtle: color-mix(in srgb, var(--border) 60%, transparent);
     --input-bg: var(--vscode-input-background, #2b2b2b);
     --input-fg: var(--vscode-input-foreground, #cccccc);
-    --input-border: var(--vscode-input-border, #3c3c3c);
-    --surface: var(--vscode-editor-background, #1e1e1e);
-    --surface-hover: var(--vscode-list-hoverBackground, rgba(255,255,255,0.04));
+    --surface-hover: var(--vscode-list-hoverBackground, rgba(255,255,255,0.06));
     --accent: var(--vscode-button-background, #0e639c);
     --accent-fg: var(--vscode-button-foreground, #ffffff);
     --accent-hover: var(--vscode-button-hoverBackground, #1177bb);
-    --user-bg: var(--vscode-input-background, #2a2a2a);
-    --assistant-bg: transparent;
+    --accent-soft: color-mix(in srgb, var(--accent) 18%, var(--bg));
+    --ok: #5fb85f;
+    --err: #d97c7c;
+    --warn: #d9a441;
     --link-fg: var(--vscode-textLink-foreground, #3794ff);
     --code-bg: var(--vscode-textCodeBlock-background, #2d2d2d);
     --font: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
     --mono-font: var(--vscode-editor-font-family, "Cascadia Code", "Fira Code", monospace);
-    --radius: 10px;
     --radius-sm: 6px;
+    --radius: 10px;
   }
-
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: var(--font);
@@ -780,116 +749,166 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     height: 100vh;
     overflow: hidden;
   }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
-  /* ── Toolbar ── */
-  .toolbar {
+  /* ── Header ── */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 10px 8px 12px;
+    border-bottom: 1px solid var(--border-subtle);
+    flex-shrink: 0;
+  }
+  .brand {
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--border);
-    flex-shrink: 0;
-  }
-  .session-select {
-    flex: 1;
-    min-width: 0;
-    background: transparent;
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 0.4px;
     color: var(--fg);
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    padding: 4px 8px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
   }
-  .session-select:hover { background: var(--surface-hover); }
-  .session-select option {
-    color: var(--vscode-foreground, #ccc);
-    background: var(--vscode-dropdown-background, #3c3c3c);
+  .brand .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--ok);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent);
+    flex-shrink: 0;
   }
   .icon-btn {
-    width: 28px;
-    height: 28px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    background: transparent;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    color: var(--fg);
-    cursor: pointer;
-    font-size: 14px;
+    width: 26px; height: 26px;
+    border: none; background: transparent;
+    color: var(--muted);
+    border-radius: 5px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; flex-shrink: 0;
+  }
+  .icon-btn:hover { background: var(--surface-hover); color: var(--fg); }
+
+  /* ── Session bar ── */
+  .session-bar {
+    position: relative;
+    border-bottom: 1px solid var(--border-subtle);
     flex-shrink: 0;
   }
-  .icon-btn:hover { background: var(--surface-hover); }
+  .session-picker {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: none;
+    color: var(--fg);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 7px 10px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .session-picker:hover { background: var(--surface-hover); }
+  .session-picker .name {
+    flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .session-picker .chev {
+    flex: 0 0 auto;
+    color: var(--muted);
+    transition: transform 0.15s;
+  }
+  .session-picker.open .chev { transform: rotate(180deg); }
+
+  .history-dropdown {
+    position: absolute;
+    top: calc(100% + 1px); left: 6px; right: 6px;
+    background: var(--vscode-dropdown-background, var(--bg));
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    padding: 4px;
+    z-index: 30;
+    display: none;
+  }
+  .history-dropdown.show { display: block; }
+  .history-item {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px; padding: 6px 8px; border-radius: 6px;
+    font-size: 12px; cursor: pointer;
+  }
+  .history-item:hover { background: var(--surface-hover); }
+  .history-item.active { background: var(--accent-soft); color: var(--accent); }
+  .history-item .t {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .history-item .time {
+    flex: 0 0 auto; font-size: 10px; color: var(--muted);
+  }
+  .hist-divider { height: 1px; background: var(--border-subtle); margin: 4px 2px; }
+  .new-session-btn {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 8px; border-radius: 6px;
+    font-size: 12px; color: var(--accent); cursor: pointer;
+  }
+  .new-session-btn:hover { background: var(--accent-soft); }
 
   /* ── Messages ── */
   .messages {
     flex: 1;
     overflow-y: auto;
-    padding: 16px 12px;
+    padding: 12px 10px;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 12px;
   }
   .messages:empty::after {
     content: "有什么可以帮你的？";
     display: block;
     text-align: center;
     color: var(--muted);
-    font-size: 14px;
+    font-size: 13px;
     margin-top: 48px;
   }
 
-  .msg { animation: fadeIn 0.2s ease; line-height: 1.6; }
+  .msg-row { display: flex; gap: 8px; align-items: flex-start; animation: fadeIn 0.2s ease; }
   @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
-  .msg.user {
-    align-self: flex-end;
-    max-width: 88%;
+  .avatar {
+    flex: 0 0 auto;
+    width: 20px; height: 20px;
+    border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 9px; font-weight: 700;
+    margin-top: 3px;
   }
-  .msg.user .bubble {
-    background: var(--user-bg);
-    border: 1px solid var(--border);
-    border-radius: 14px 14px 4px 14px;
-    padding: 10px 14px;
-    word-break: break-word;
-  }
+  .avatar.user { background: color-mix(in srgb, var(--fg) 12%, transparent); color: var(--muted); }
+  .avatar.ai { background: var(--accent-soft); color: var(--accent); }
 
-  .msg.assistant {
-    align-self: stretch;
-    width: 100%;
-  }
-  .msg.assistant .bubble {
-    background: var(--assistant-bg);
-    padding: 2px 2px;
-    word-break: break-word;
-  }
-
-  .bubble p { margin: 6px 0; }
-  .bubble p:first-child { margin-top: 0; }
-  .bubble p:last-child { margin-bottom: 0; }
-  .bubble code {
+  .msg-body { flex: 1; min-width: 0; }
+  .msg-body p { margin: 6px 0; line-height: 1.55; }
+  .msg-body p:first-child { margin-top: 0; }
+  .msg-body p:last-child { margin-bottom: 0; }
+  .msg-body code {
     font-family: var(--mono-font);
-    font-size: 12px;
+    font-size: 11.5px;
     background: rgba(127,127,127,0.15);
-    padding: 2px 6px;
+    padding: 1px 5px;
     border-radius: 4px;
   }
-  .bubble pre { margin: 10px 0; position: relative; }
-  .bubble pre code {
+  .msg-body pre { margin: 8px 0; }
+  .msg-body pre code {
     display: block;
-    padding: 12px 14px;
+    padding: 10px 12px;
     overflow-x: auto;
     background: var(--code-bg);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    font-size: 12px;
+    font-size: 11.5px;
     line-height: 1.45;
   }
-  .bubble a { color: var(--link-fg); }
-  .bubble ul { padding-left: 20px; margin: 6px 0; }
-
+  .msg-body a { color: var(--link-fg); }
+  .msg-body ul { padding-left: 18px; margin: 6px 0; }
+  .msg-text { line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
   .streaming-cursor::after {
     content: "▍";
     animation: blink 0.8s step-end infinite;
@@ -897,183 +916,243 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
   @keyframes blink { 50% { opacity: 0; } }
 
-  /* ── Tool cards (compact) ── */
+  /* ── Tool cards ── */
   .tool-card {
-    margin: 6px 0;
-    border: 1px solid var(--border);
+    margin: 5px 0;
+    border: 1px solid var(--border-subtle);
     border-radius: var(--radius-sm);
     overflow: hidden;
-    background: var(--surface-hover);
+    background: color-mix(in srgb, var(--bg) 98%, var(--accent));
   }
   .tool-card-header {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 10px;
+    gap: 7px;
+    padding: 5px 9px;
     cursor: pointer;
     user-select: none;
-    font-size: 12px;
   }
-  .tool-card-header:hover { background: rgba(127,127,127,0.08); }
+  .tool-card-header:hover { background: var(--surface-hover); }
   .tool-card-header .chevron {
-    font-size: 10px;
-    opacity: 0.6;
+    font-size: 9px;
+    color: var(--muted);
     transition: transform 0.15s;
+    flex: 0 0 auto;
   }
-  .tool-card-header.open .chevron { transform: rotate(90deg); }
-  .tool-card-header .name {
+  .tool-card.open .tool-card-header .chevron { transform: rotate(90deg); }
+  .tool-card-header .tname {
     font-family: var(--mono-font);
     font-size: 11px;
-    opacity: 0.9;
+    flex: 0 0 auto;
   }
-  .tool-card-header .status {
-    margin-left: auto;
-    font-size: 11px;
+  .tool-card-header .tsummary {
+    flex: 1; min-width: 0;
     color: var(--muted);
+    font-size: 11px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .status-pill {
+    flex: 0 0 auto;
+    font-size: 10px;
+    padding: 1px 7px;
+    border-radius: 20px;
+  }
+  .status-pill.done { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+  .status-pill.running { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+  .status-pill.error { background: color-mix(in srgb, var(--err) 16%, transparent); color: var(--err); }
   .tool-card-body {
     display: none;
-    padding: 8px 10px 10px;
-    border-top: 1px solid var(--border);
+    padding: 8px 10px;
+    border-top: 1px solid var(--border-subtle);
     font-family: var(--mono-font);
     font-size: 11px;
-    max-height: 200px;
-    overflow: auto;
-  }
-  .tool-card-body.open { display: block; }
-  .tool-card-body pre { white-space: pre-wrap; word-break: break-all; line-height: 1.4; }
-  .tool-card-body .label {
-    font-family: var(--font);
-    font-size: 10px;
     color: var(--muted);
-    margin: 6px 0 3px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    background: color-mix(in srgb, var(--code-bg) 50%, transparent);
+    max-height: 180px;
+    overflow: auto;
+    line-height: 1.5;
+    white-space: pre-wrap;
   }
+  .tool-card.open .tool-card-body { display: block; }
 
   /* ── Permission panel ── */
   .permission-panel {
     margin: 0 10px 8px;
-    padding: 12px 14px;
+    padding: 10px 12px;
     border: 1px solid var(--accent);
-    border-radius: var(--radius);
-    background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+    border-radius: var(--radius-sm);
+    background: var(--accent-soft);
     flex-shrink: 0;
   }
   .permission-panel.hidden { display: none; }
-  .permission-title {
-    font-size: 13px;
-    font-weight: 600;
-    margin-bottom: 6px;
-  }
+  .permission-title { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
   .permission-detail {
-    font-size: 12px;
-    color: var(--muted);
+    font-size: 11px; color: var(--muted);
     font-family: var(--mono-font);
     word-break: break-all;
-    margin-bottom: 10px;
+    margin-bottom: 8px;
     line-height: 1.5;
   }
-  .permission-actions {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
+  .permission-actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .permission-actions button {
-    flex: 1;
-    min-width: 80px;
-    padding: 6px 10px;
-    border-radius: var(--radius-sm);
+    flex: 1; min-width: 70px;
+    padding: 5px 8px;
+    border-radius: 5px;
     border: none;
     background: var(--accent);
     color: var(--accent-fg);
-    font-size: 12px;
+    font-size: 11px;
     cursor: pointer;
   }
-  .permission-actions button:hover { background: var(--accent-hover); }
+  .permission-actions button:hover { filter: brightness(1.1); }
   .permission-actions button.secondary {
     background: transparent;
     color: var(--fg);
     border: 1px solid var(--border);
   }
-  .permission-actions button.secondary:hover { background: var(--surface-hover); }
 
   /* ── Composer ── */
   .composer {
     flex-shrink: 0;
-    padding: 8px 10px 10px;
-    border-top: 1px solid var(--border);
-    background: var(--bg);
-  }
-  .composer-meta {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 8px;
-  }
-  .chip-select {
-    flex: 1;
-    min-width: 0;
-    background: var(--surface-hover);
-    color: var(--muted);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 3px 10px;
-    font-size: 11px;
-    cursor: pointer;
-  }
-  .chip-select option {
-    color: var(--vscode-foreground, #ccc);
-    background: var(--vscode-dropdown-background, #3c3c3c);
+    padding: 6px 10px 8px;
+    border-top: 1px solid var(--border-subtle);
   }
   .composer-box {
-    display: flex;
-    align-items: flex-end;
-    gap: 8px;
     background: var(--input-bg);
-    border: 1px solid var(--input-border);
-    border-radius: var(--radius);
-    padding: 8px 8px 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 6px 6px 4px;
     transition: border-color 0.15s;
   }
-  .composer-box:focus-within {
-    border-color: var(--accent);
-  }
+  .composer-box:focus-within { border-color: var(--accent); }
   .composer-box textarea {
-    flex: 1;
+    width: 100%;
     background: transparent;
-    color: var(--input-fg);
-    border: none;
-    outline: none;
-    font-family: var(--font);
-    font-size: 13px;
+    border: none; outline: none;
     resize: none;
-    min-height: 22px;
-    max-height: 140px;
+    color: var(--input-fg);
+    font-family: var(--font);
+    font-size: 12.5px;
     line-height: 1.5;
+    min-height: 30px;
+    max-height: 120px;
   }
   .composer-box textarea::placeholder { color: var(--muted); }
+  .composer-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 2px;
+  }
+  .composer-toolbar .left { display: flex; align-items: center; gap: 4px; min-width: 0; }
+
+  .model-chip {
+    display: flex; align-items: center; gap: 5px;
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: 20px;
+    padding: 2px 8px 2px 5px;
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 10.5px;
+    max-width: 160px;
+  }
+  .model-chip:hover { border-color: var(--border); color: var(--fg); }
+  .model-chip .dot {
+    width: 10px; height: 10px;
+    border-radius: 3px;
+    background: linear-gradient(135deg, #4f8ef7, #6a5cf0);
+    flex: 0 0 auto;
+  }
+  .model-chip .mname {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
   .send-btn {
-    width: 32px;
-    height: 32px;
+    width: 26px; height: 26px;
+    border-radius: 50%;
     border: none;
-    border-radius: 8px;
     background: var(--accent);
     color: var(--accent-fg);
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    transition: background 0.15s, opacity 0.15s;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; flex: 0 0 auto;
   }
-  .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
-  .send-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .send-btn:hover { filter: brightness(1.1); }
   .send-btn.cancel {
     background: transparent;
     color: var(--fg);
     border: 1px solid var(--border);
+    border-radius: 5px;
+    width: 28px; height: 28px;
   }
-  .send-btn.cancel:hover { background: var(--surface-hover); }
+  .send-btn.cancel:hover { filter: none; background: var(--surface-hover); }
+
+  .model-popover {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 10px;
+    width: 240px;
+    background: var(--vscode-dropdown-background, var(--bg));
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.4);
+    padding: 8px;
+    z-index: 30;
+    display: none;
+  }
+  .model-popover.show { display: block; }
+  .pop-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--muted);
+    padding: 2px 4px 6px;
+  }
+  .provider-chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 2px 6px; }
+  .provider-chip {
+    padding: 3px 8px;
+    border-radius: 20px;
+    font-size: 11px;
+    background: var(--surface-hover);
+    color: var(--muted);
+    border: 1px solid var(--border-subtle);
+    cursor: pointer;
+  }
+  .provider-chip:hover { border-color: var(--border); color: var(--fg); }
+  .provider-chip.active { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+  .model-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    max-height: 120px;
+    overflow-y: auto;
+  }
+  .model-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 5px 8px; border-radius: 6px;
+    font-size: 11.5px; cursor: pointer;
+  }
+  .model-item:hover { background: var(--surface-hover); }
+  .model-item.active { background: var(--accent-soft); color: var(--accent); }
+  .manage-link {
+    display: flex; align-items: center; gap: 5px;
+    margin-top: 4px; padding: 6px 8px;
+    border-top: 1px solid var(--border-subtle);
+    font-size: 11px; color: var(--muted); cursor: pointer;
+  }
+  .manage-link:hover { color: var(--fg); }
+
+  /* ── Status bar ── */
+  .statusbar {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 10px;
+    font-size: 9.5px;
+    color: var(--muted);
+    border-top: 1px solid var(--border-subtle);
+    font-family: var(--mono-font);
+    flex-shrink: 0;
+  }
 
   .toast-container {
     position: fixed;
@@ -1087,25 +1166,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
     border: 1px solid var(--vscode-inputValidation-errorBorder, #be1100);
     color: var(--vscode-inputValidation-errorForeground, #ffeaea);
-    padding: 8px 14px;
+    padding: 7px 12px;
     border-radius: var(--radius-sm);
-    font-size: 12px;
+    font-size: 11px;
     animation: slideUp 0.2s ease;
     max-width: 90vw;
+    pointer-events: auto;
   }
   @keyframes slideUp { from { transform: translateY(8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 </style>
 </head>
 <body>
 
-  <div class="toolbar">
-    <select class="session-select" id="sessionSelect">${selects.sessions}</select>
-    <button class="icon-btn" id="newSessionBtn" title="新建会话">+</button>
-    <button class="icon-btn" id="settingsBtn" title="供应商设置">⚙</button>
+  <!-- Header -->
+  <div class="header">
+    <div class="brand"><span class="dot"></span>HXXCODE</div>
+    <div class="header-actions">
+      <button class="icon-btn" id="settingsBtn" title="供应商设置">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M8 1v2M8 13v2M2.5 4.5l1.5 1.5M12 10l1.5 1.5M1 8h2M13 8h2M2.5 11.5L4 10M12 6l1.5-1.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+      </button>
+    </div>
   </div>
 
+  <!-- Session bar -->
+  <div class="session-bar">
+    <button class="session-picker" id="sessionPicker">
+      <span class="name" id="sessionName">会话 1</span>
+      <svg class="chev" width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <div class="history-dropdown" id="historyDropdown">
+      <div class="new-session-btn" id="newSessionBtn">
+        <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        新建会话
+      </div>
+      <div class="hist-divider"></div>
+      <div id="sessionList"></div>
+    </div>
+  </div>
+
+  <!-- Messages -->
   <div class="messages" id="messagesContainer"></div>
 
+  <!-- Permission panel -->
   <div class="permission-panel hidden" id="permissionPanel">
     <div class="permission-title" id="permissionTitle">需要您的确认</div>
     <div class="permission-detail" id="permissionDetail"></div>
@@ -1116,17 +1218,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
   </div>
 
-  <div class="composer">
-    <div class="composer-meta">
-      <select id="providerSelect" class="chip-select">${selects.providers}</select>
-      <select id="modelSelect" class="chip-select">${selects.models}</select>
+  <!-- Composer -->
+  <div class="composer" style="position:relative">
+    <div class="model-popover" id="modelPopover">
+      <div class="pop-label">供应商</div>
+      <div class="provider-chips" id="providerChips"></div>
+      <div class="pop-label">模型</div>
+      <div class="model-list" id="modelList"></div>
+      <div class="manage-link" id="manageLink">
+        <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M8 1v2M8 13v2M2.5 4.5l1.5 1.5M12 10l1.5 1.5M1 8h2M13 8h2M2.5 11.5L4 10M12 6l1.5-1.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+        管理供应商与模型…
+      </div>
     </div>
+
     <div class="composer-box">
       <textarea id="inputBox" placeholder="输入消息，Enter 发送，Shift+Enter 换行" rows="1"></textarea>
-      <button class="send-btn" id="sendBtn" title="发送" aria-label="发送">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>
-      </button>
+      <div class="composer-toolbar">
+        <div class="left">
+          <button class="model-chip" id="modelChip">
+            <span class="dot"></span>
+            <span class="mname" id="modelChipName">模型</span>
+            <svg class="chev" width="8" height="8" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+        <button class="send-btn" id="sendBtn" title="发送" aria-label="发送">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M4 7l4-4 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
     </div>
+  </div>
+
+  <!-- Status bar -->
+  <div class="statusbar" id="statusbar">
+    <span id="statusLeft"></span>
+    <span id="statusRight"></span>
   </div>
 
   <div class="toast-container" id="toastContainer"></div>

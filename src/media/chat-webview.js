@@ -6,19 +6,28 @@
     const messagesEl = $("messagesContainer");
     const inputBox = $("inputBox");
     const sendBtn = $("sendBtn");
-    const sessionSelect = $("sessionSelect");
+    const sessionPicker = $("sessionPicker");
+    const sessionName = $("sessionName");
+    const historyDropdown = $("historyDropdown");
+    const sessionList = $("sessionList");
     const newSessionBtn = $("newSessionBtn");
     const settingsBtn = $("settingsBtn");
-    const providerSelect = $("providerSelect");
-    const modelSelect = $("modelSelect");
+    const modelChip = $("modelChip");
+    const modelChipName = $("modelChipName");
+    const modelPopover = $("modelPopover");
+    const providerChips = $("providerChips");
+    const modelList = $("modelList");
+    const manageLink = $("manageLink");
     const permissionPanel = $("permissionPanel");
     const permissionTitle = $("permissionTitle");
     const permissionDetail = $("permissionDetail");
+    const statusLeft = $("statusLeft");
+    const statusRight = $("statusRight");
 
     const SEND_ICON =
-      '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>';
+      '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M4 7l4-4 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
     const STOP_ICON =
-      '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>';
+      '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>';
 
     let state = {
       sessions: [],
@@ -42,61 +51,101 @@
       grep: "搜索内容",
     };
 
+    // ── State update ──
+
     function updateState(newState) {
       state = { ...state, ...newState };
       renderSessions();
       renderProviders();
       renderMessages();
       updateInputState();
+      updateStatusBar();
     }
+
+    // ── Session picker ──
 
     function renderSessions() {
-      if (!sessionSelect) return;
-      sessionSelect.innerHTML = "";
+      if (!sessionName || !sessionList) return;
+      // 更新标题
+      const activeSession = state.sessions.find((s) => s.id === state.activeSessionId);
+      sessionName.textContent = activeSession ? activeSession.title : "选择会话";
+
+      // 更新下拉列表
+      sessionList.innerHTML = "";
       for (const s of state.sessions) {
-        const opt = document.createElement("option");
-        opt.value = s.id;
-        opt.textContent = s.title;
-        sessionSelect.appendChild(opt);
+        const item = document.createElement("div");
+        item.className = "history-item" + (s.id === state.activeSessionId ? " active" : "");
+        item.dataset.sid = s.id;
+        item.innerHTML =
+          '<span class="t">' + escapeHtml(s.title) + '</span>' +
+          '<span class="time">' + timeAgo(s.createdAt) + '</span>';
+        item.addEventListener("click", () => {
+          vscode.postMessage({ type: "switchSession", payload: { sessionId: s.id } });
+          closeDropdown();
+        });
+        sessionList.appendChild(item);
       }
-      const activeId = state.sessions.some((s) => s.id === state.activeSessionId)
-        ? state.activeSessionId
-        : state.sessions[0]?.id ?? null;
-      if (activeId) sessionSelect.value = activeId;
     }
 
+    function timeAgo(ts) {
+      const diff = Date.now() - ts;
+      if (diff < 60000) return "刚刚";
+      if (diff < 3600000) return Math.floor(diff / 60000) + "分钟前";
+      if (diff < 86400000) return Math.floor(diff / 3600000) + "小时前";
+      return Math.floor(diff / 86400000) + "天前";
+    }
+
+    // ── Provider / Model popover ──
+
     function renderProviders() {
-      if (!providerSelect) return;
-      providerSelect.innerHTML = "";
+      if (!providerChips) return;
+      providerChips.innerHTML = "";
       for (const p of state.providers) {
-        const opt = document.createElement("option");
-        opt.value = p.id;
-        opt.textContent = p.name + (p.isDefault ? " ★" : "");
-        providerSelect.appendChild(opt);
+        const chip = document.createElement("div");
+        chip.className = "provider-chip" + (p.id === state.activeProviderId ? " active" : "");
+        chip.textContent = p.name;
+        chip.dataset.pid = p.id;
+        chip.addEventListener("click", () => {
+          vscode.postMessage({
+            type: "switchModel",
+            payload: { providerId: p.id, model: p.models[0] || "" },
+          });
+          // popover 不自动关闭，让用户进一步选择模型
+        });
+        providerChips.appendChild(chip);
       }
-      if (state.activeProviderId) providerSelect.value = state.activeProviderId;
       renderModels();
     }
 
     function renderModels() {
-      if (!modelSelect) return;
-      const provider = state.providers.find((p) => p.id === providerSelect.value);
-      modelSelect.innerHTML = "";
+      if (!modelList) return;
+      const provider = state.providers.find((p) => p.id === state.activeProviderId);
+      modelList.innerHTML = "";
       if (provider) {
         for (const m of provider.models) {
-          const opt = document.createElement("option");
-          opt.value = m;
-          opt.textContent = m;
-          modelSelect.appendChild(opt);
+          const item = document.createElement("div");
+          item.className = "model-item" + (m === state.activeModel ? " active" : "");
+          item.textContent = m;
+          item.dataset.model = m;
+          item.addEventListener("click", () => {
+            vscode.postMessage({
+              type: "switchModel",
+              payload: { providerId: provider.id, model: m },
+            });
+            closePopover();
+          });
+          modelList.appendChild(item);
         }
       }
-      if (
-        state.activeModel &&
-        Array.from(modelSelect.options).some((o) => o.value === state.activeModel)
-      ) {
-        modelSelect.value = state.activeModel;
-      }
+      updateModelChip();
     }
+
+    function updateModelChip() {
+      if (!modelChipName) return;
+      modelChipName.textContent = state.activeModel || "选择模型";
+    }
+
+    // ── Messages ──
 
     function renderMessages() {
       if (!messagesEl) return;
@@ -104,30 +153,40 @@
       messagesEl.innerHTML = "";
 
       for (const msg of state.messages) {
-        const div = document.createElement("div");
-        div.className = "msg " + msg.role;
+        const row = document.createElement("div");
+        row.className = "msg-row";
 
-        const bubble = document.createElement("div");
-        bubble.className = "bubble";
+        // 头像
+        const avatar = document.createElement("div");
+        avatar.className = "avatar " + msg.role;
+        avatar.textContent = msg.role === "user" ? "你" : "AI";
+        row.appendChild(avatar);
 
+        // 消息体
+        const body = document.createElement("div");
+        body.className = "msg-body";
+
+        // 文本内容
         if (msg.text) {
-          const content = document.createElement("div");
-          content.innerHTML = renderMarkdown(msg.text);
-          if (msg.isStreaming) content.classList.add("streaming-cursor");
-          bubble.appendChild(content);
+          const textDiv = document.createElement("div");
+          textDiv.className = "msg-text" + (msg.text.startsWith("**错误**") ? " error" : "");
+          textDiv.innerHTML = renderMarkdown(msg.text);
+          if (msg.isStreaming) textDiv.classList.add("streaming-cursor");
+          body.appendChild(textDiv);
         } else if (msg.isStreaming) {
           const cursor = document.createElement("span");
           cursor.className = "streaming-cursor";
           cursor.style.display = "inline-block";
-          bubble.appendChild(cursor);
+          body.appendChild(cursor);
         }
 
+        // 工具卡片
         for (const tc of msg.toolCalls || []) {
-          bubble.appendChild(renderToolCard(tc));
+          body.appendChild(renderToolCard(tc));
         }
 
-        div.appendChild(bubble);
-        messagesEl.appendChild(div);
+        row.appendChild(body);
+        messagesEl.appendChild(row);
       }
 
       if (wasAtBottom || state.messages.length === 0) scrollToBottom();
@@ -141,47 +200,27 @@
       header.className = "tool-card-header";
       header.innerHTML =
         '<span class="chevron">▶</span>' +
-        '<span class="name">' +
-        escapeHtml(tc.name) +
-        "</span>" +
-        '<span class="status">' +
-        (tc.isRunning ? "运行中…" : "完成") +
+        '<span class="tname">' + escapeHtml(tc.name) + '</span>' +
+        '<span class="tsummary">' + escapeHtml(tc.input && tc.input.length > 80 ? tc.input.slice(0, 80) + "…" : tc.input || "") + '</span>' +
+        '<span class="status-pill ' + (tc.isRunning ? "running" : "done") + '">' +
+        (tc.isRunning ? "运行中" : "完成") +
         "</span>";
 
       const body = document.createElement("div");
       body.className = "tool-card-body";
-
-      const argLabel = document.createElement("div");
-      argLabel.className = "label";
-      argLabel.textContent = "参数";
-      body.appendChild(argLabel);
-
-      const argPre = document.createElement("pre");
-      argPre.textContent = tc.input;
-      body.appendChild(argPre);
-
-      if (tc.result !== undefined) {
-        const resLabel = document.createElement("div");
-        resLabel.className = "label";
-        resLabel.textContent = "结果";
-        body.appendChild(resLabel);
-
-        const resPre = document.createElement("pre");
-        resPre.textContent =
-          tc.result.length > 2000 ? tc.result.slice(0, 2000) + "\n… (已截断)" : tc.result;
-        body.appendChild(resPre);
-      }
+      body.textContent = tc.result || tc.input || "";
 
       card.appendChild(header);
       card.appendChild(body);
 
       header.addEventListener("click", () => {
-        const open = body.classList.toggle("open");
-        header.classList.toggle("open", open);
+        card.classList.toggle("open");
       });
 
       return card;
     }
+
+    // ── Permission panel ──
 
     function showPermissionRequest(payload) {
       pendingPermissionId = payload.id;
@@ -205,6 +244,8 @@
       });
       hidePermissionRequest();
     }
+
+    // ── Streaming updates ──
 
     function updateStreamingChunk(_sessionId, _chunk, accumulatedText) {
       const lastMsg = state.messages[state.messages.length - 1];
@@ -235,6 +276,40 @@
       }
       renderMessages();
     }
+
+    // ── Status bar ──
+
+    function updateStatusBar() {
+      if (statusLeft) {
+        statusLeft.textContent = "sessions: " + state.sessions.length + " · msgs: " + state.messages.length;
+      }
+      if (statusRight) {
+        const model = state.activeModel || "";
+        statusRight.textContent = model ? "lildax · " + model : "lildax";
+      }
+    }
+
+    // ── Dropdown / Popover toggles ──
+
+    function toggleDropdown() {
+      historyDropdown?.classList.toggle("show");
+      sessionPicker?.classList.toggle("open");
+    }
+
+    function closeDropdown() {
+      historyDropdown?.classList.remove("show");
+      sessionPicker?.classList.remove("open");
+    }
+
+    function togglePopover() {
+      modelPopover?.classList.toggle("show");
+    }
+
+    function closePopover() {
+      modelPopover?.classList.remove("show");
+    }
+
+    // ── Markdown ──
 
     function renderMarkdown(text) {
       const parts = text.split(/(```[\s\S]*?```)/g);
@@ -280,6 +355,8 @@
         .replace(/"/g, "&quot;");
     }
 
+    // ── Utilities ──
+
     function isAtBottom() {
       return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 48;
     }
@@ -291,7 +368,7 @@
     function autoResizeInput() {
       if (!inputBox) return;
       inputBox.style.height = "auto";
-      inputBox.style.height = Math.min(inputBox.scrollHeight, 140) + "px";
+      inputBox.style.height = Math.min(inputBox.scrollHeight, 120) + "px";
     }
 
     function updateInputState() {
@@ -332,11 +409,66 @@
       vscode.postMessage({ type: "sendMessage", payload: { text } });
     }
 
+    // ── Event listeners ──
+
+    // Permission buttons
     permissionPanel?.querySelectorAll("[data-reply]").forEach((btn) => {
       btn.addEventListener("click", () => {
         replyPermission(btn.getAttribute("data-reply"));
       });
     });
+
+    // Session picker
+    sessionPicker?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleDropdown();
+    });
+
+    newSessionBtn?.addEventListener("click", () => {
+      closeDropdown();
+      vscode.postMessage({ type: "createSession" });
+    });
+
+    // Model chip
+    modelChip?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      togglePopover();
+    });
+
+    // Manage link
+    manageLink?.addEventListener("click", () => {
+      closePopover();
+      vscode.postMessage({ type: "openSettings" });
+    });
+
+    // Settings button
+    settingsBtn?.addEventListener("click", () => {
+      vscode.postMessage({ type: "openSettings" });
+    });
+
+    // Outside click closes dropdown and popover
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest(".session-bar")) {
+        closeDropdown();
+      }
+      if (!e.target.closest(".composer") || e.target.closest(".manage-link")) {
+        closePopover();
+      }
+    });
+
+    // Input
+    inputBox?.addEventListener("input", autoResizeInput);
+    inputBox?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        send();
+      }
+    });
+
+    // Send button
+    sendBtn?.addEventListener("click", send);
+
+    // ── Webview messages from extension ──
 
     window.addEventListener("message", (event) => {
       const msg = event.data;
@@ -372,38 +504,7 @@
       }
     });
 
-    inputBox?.addEventListener("input", autoResizeInput);
-    inputBox?.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        send();
-      }
-    });
-    sendBtn?.addEventListener("click", send);
-    sessionSelect?.addEventListener("change", () => {
-      vscode.postMessage({ type: "switchSession", payload: { sessionId: sessionSelect.value } });
-    });
-    newSessionBtn?.addEventListener("click", () => {
-      vscode.postMessage({ type: "createSession" });
-    });
-    settingsBtn?.addEventListener("click", () => {
-      vscode.postMessage({ type: "openSettings" });
-    });
-    providerSelect?.addEventListener("change", () => {
-      const provider = state.providers.find((p) => p.id === providerSelect.value);
-      if (provider && provider.models.length > 0) {
-        vscode.postMessage({
-          type: "switchModel",
-          payload: { providerId: provider.id, model: provider.models[0] },
-        });
-      }
-    });
-    modelSelect?.addEventListener("change", () => {
-      vscode.postMessage({
-        type: "switchModel",
-        payload: { providerId: providerSelect.value, model: modelSelect.value },
-      });
-    });
+    // ── Boot ──
 
     const bootEl = document.getElementById("boot-state");
     if (bootEl && bootEl.textContent) {
