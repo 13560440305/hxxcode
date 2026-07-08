@@ -1,0 +1,10 @@
+{
+  "name": "@opencode-ai/sdk",
+  "version": "0.1.0",
+  "description": "Local SDK stub for OpenCode — spawns `opencode serve` and provides a typed HTTP client",
+  "main": "index.mjs",
+  "types": "index.d.ts",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -405,6 +405,42 @@ export class SettingsPanel {
   }
   .model-tag-add:hover { color: var(--accent); border-color: var(--accent); }
 
+  .model-add-inline {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1 1 180px;
+    min-width: 160px;
+  }
+  .model-add-inline input {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg-input);
+    border: 1px solid var(--border-subtle);
+    color: var(--text);
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    outline: none;
+  }
+  .model-add-inline input:focus { border-color: var(--accent); }
+  .model-add-inline button {
+    border: 1px solid var(--border-subtle);
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 10.5px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    flex: 0 0 auto;
+  }
+  .model-add-inline button:hover { border-color: var(--border); color: var(--text); }
+  .model-add-inline button.confirm {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-color: transparent;
+  }
+
   .fetch-row {
     display: flex;
     align-items: center;
@@ -446,7 +482,7 @@ export class SettingsPanel {
     <div class="provider-list-wrap">
       <div class="plw-head">
         <span class="t">模型供应商</span>
-        <button class="add-btn" id="addBtn">
+        <button type="button" class="add-btn" id="addBtn">
           <svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
           添加
         </button>
@@ -498,7 +534,7 @@ export class SettingsPanel {
             <label>API Key</label>
             <div class="key-wrap">
               <input type="password" id="editApiKey" placeholder="sk-..." />
-              <button class="key-toggle" id="keyToggle" onclick="const i=document.getElementById('editApiKey');i.type=i.type==='password'?'text':'password';">
+              <button type="button" class="key-toggle" id="keyToggle">
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5Z" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/></svg>
               </button>
             </div>
@@ -507,11 +543,9 @@ export class SettingsPanel {
 
         <div class="section-title">
           模型列表
-          <span class="hint">点击标签删除，或自动拉取</span>
+          <span class="hint">点击 × 删除；点 + 添加或自动拉取</span>
         </div>
-        <div class="model-chips-editor" id="modelsEditor">
-          <button class="model-tag-add" id="addModelBtn">+ 添加模型</button>
-        </div>
+        <div class="model-chips-editor" id="modelsEditor"></div>
         <div class="fetch-row">
           <button class="btn btn-ghost" id="fetchModelsBtn">↻ 自动拉取模型列表</button>
           <span class="hint-text">通过 /v1/models 接口获取该供应商支持的全部模型</span>
@@ -531,6 +565,7 @@ export class SettingsPanel {
 
 <script nonce="${nonce}">
 (function() {
+  try {
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
 
@@ -557,6 +592,7 @@ export class SettingsPanel {
     renderProviders();
     // 如果正在新建中（ID 以 new- 开头），保持编辑表单不重置
     if (currentEditId && currentEditId.startsWith("new-")) {
+      showEditForm();
       return;
     }
     // 如果当前编辑的供应商还在列表中，刷新编辑区；否则清空
@@ -567,6 +603,15 @@ export class SettingsPanel {
       currentEditId = null;
       showEmptyState();
     }
+  }
+
+  function formatProviderUrl(baseURL) {
+    if (!baseURL) return "";
+    let s = baseURL;
+    if (s.indexOf("https://") === 0) s = s.slice(8);
+    else if (s.indexOf("http://") === 0) s = s.slice(7);
+    while (s.endsWith("/")) s = s.slice(0, -1);
+    return s;
   }
 
   function renderProviders() {
@@ -583,7 +628,7 @@ export class SettingsPanel {
         '<div class="p-dot" style="background:' + dotColor(i) + '">' + dotLetter(p.name) + '</div>' +
         '<div class="p-info">' +
           '<div class="p-name">' + escapeHtml(p.name) + (isActive ? ' <span class="current-badge">当前</span>' : '') + '</div>' +
-          '<div class="p-url">' + escapeHtml(p.baseURL ? p.baseURL.replace(/^https?:\/\//, "").replace(/\/+$/, "") : "") + '</div>' +
+          '<div class="p-url">' + escapeHtml(formatProviderUrl(p.baseURL)) + '</div>' +
         '</div>';
       row.addEventListener("click", () => selectProvider(p.id));
       list.appendChild(row);
@@ -600,6 +645,7 @@ export class SettingsPanel {
   function fillEditForm(p) {
     showEditForm();
     currentEditId = p.id;
+    modelInputOpen = false;
     $("editTitle").textContent = p.name;
     $("editDot").style.background = dotColor(state.providers.indexOf(p));
     $("editName").value = p.name;
@@ -623,11 +669,74 @@ export class SettingsPanel {
 
   // ── Model chips ──
 
+  let modelInputOpen = false;
+
+  function commitModelInput() {
+    const input = $("modelNameInput");
+    if (!input) return;
+    const name = input.value.trim();
+    if (!name) {
+      input.focus();
+      return;
+    }
+    if (!pendingModels.includes(name)) {
+      pendingModels.push(name);
+    }
+    modelInputOpen = false;
+    renderModelChips();
+  }
+
+  function cancelModelInput() {
+    modelInputOpen = false;
+    renderModelChips();
+  }
+
+  function openModelInput() {
+    modelInputOpen = true;
+    renderModelChips();
+    const input = $("modelNameInput");
+    input?.focus();
+  }
+
+  function appendModelAddInline(editor) {
+    const row = document.createElement("div");
+    row.className = "model-add-inline";
+    row.id = "modelAddRow";
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.id = "modelNameInput";
+    input.placeholder = "输入模型名称，Enter 确认";
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        commitModelInput();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        cancelModelInput();
+      }
+    });
+
+    const confirmBtn = document.createElement("button");
+    confirmBtn.type = "button";
+    confirmBtn.className = "confirm";
+    confirmBtn.textContent = "添加";
+    confirmBtn.addEventListener("click", commitModelInput);
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.textContent = "取消";
+    cancelBtn.addEventListener("click", cancelModelInput);
+
+    row.appendChild(input);
+    row.appendChild(confirmBtn);
+    row.appendChild(cancelBtn);
+    editor.appendChild(row);
+  }
+
   function renderModelChips() {
     const editor = $("modelsEditor");
     if (!editor) return;
-    // 保留 add 按钮
-    const addBtn = editor.querySelector(".model-tag-add");
     editor.innerHTML = "";
     for (const m of pendingModels) {
       const tag = document.createElement("div");
@@ -639,19 +748,19 @@ export class SettingsPanel {
       });
       editor.appendChild(tag);
     }
-    // 重新添加 add 按钮
-    const newAdd = document.createElement("button");
-    newAdd.className = "model-tag-add";
-    newAdd.id = "addModelBtn";
-    newAdd.textContent = "+ 添加模型";
-    newAdd.addEventListener("click", () => {
-      const name = prompt("输入模型名称：");
-      if (name && name.trim()) {
-        pendingModels.push(name.trim());
-        renderModelChips();
-      }
-    });
-    editor.appendChild(newAdd);
+
+    if (modelInputOpen) {
+      appendModelAddInline(editor);
+      return;
+    }
+
+    const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "model-tag-add";
+    addBtn.id = "addModelBtn";
+    addBtn.textContent = "+ 添加模型";
+    addBtn.addEventListener("click", openModelInput);
+    editor.appendChild(addBtn);
   }
 
   // ── Utilities ──
@@ -665,13 +774,30 @@ export class SettingsPanel {
 
   // ── Collect form data ──
 
+  function slugifyId(name) {
+    let s = "";
+    for (const c of name.toLowerCase()) {
+      const code = c.charCodeAt(0);
+      if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57)) {
+        s += c;
+      } else {
+        s += "-";
+      }
+    }
+    while (s.indexOf("--") >= 0) s = s.split("--").join("-");
+    while (s.length > 0 && s.charAt(0) === "-") s = s.slice(1);
+    while (s.length > 0 && s.charAt(s.length - 1) === "-") s = s.slice(0, -1);
+    return s;
+  }
+
   function getFormConfig() {
     let id = currentEditId;
     const name = $("editName").value.trim();
     if (!name) { alert("请输入供应商名称"); return null; }
     // 如果是新建（id 以 new- 开头），生成新的 id
     if (!id || id.startsWith("new-")) {
-      id = name.toLowerCase().replace(/[^a-z0-9]/g, "-") + "-" + Date.now().toString(36);
+      const slug = slugifyId(name) || "provider";
+      id = slug + "-" + Date.now().toString(36);
     }
     return {
       config: {
@@ -687,9 +813,10 @@ export class SettingsPanel {
 
   // ── Event listeners ──
 
-  $("addBtn").addEventListener("click", () => {
+  function startNewProvider() {
     currentEditId = "new-" + Date.now().toString(36);
     pendingModels = [];
+    modelInputOpen = false;
     showEditForm();
     $("editTitle").textContent = "新建供应商";
     $("editDot").style.background = dotColor(state.providers.length);
@@ -699,7 +826,10 @@ export class SettingsPanel {
     $("editApiKey").value = "";
     renderModelChips();
     renderProviders();
-  });
+    $("editName")?.focus();
+  }
+
+  $("addBtn")?.addEventListener("click", startNewProvider);
 
   function save() {
     const data = getFormConfig();
@@ -730,6 +860,12 @@ export class SettingsPanel {
     }
   });
 
+  $("keyToggle")?.addEventListener("click", () => {
+    const input = $("editApiKey");
+    if (!input) return;
+    input.type = input.type === "password" ? "text" : "password";
+  });
+
   $("fetchModelsBtn").addEventListener("click", () => {
     const baseURL = $("editBaseURL").value.trim();
     const apiKey = $("editApiKey").value.trim();
@@ -749,6 +885,7 @@ export class SettingsPanel {
     }
     if (type === "modelsFetched") {
       pendingModels = payload.models;
+      modelInputOpen = false;
       renderModelChips();
       $("fetchModelsBtn").textContent = "↻ 自动拉取模型列表";
       $("fetchModelsBtn").disabled = false;
@@ -763,6 +900,13 @@ export class SettingsPanel {
   // ── Init ──
 
   vscode.postMessage({ type: "requestState" });
+  } catch (err) {
+    document.body.innerHTML =
+      '<div style="padding:20px;color:var(--vscode-errorForeground,#f48771)">' +
+      '<h3>设置面板加载出错</h3><pre style="white-space:pre-wrap;font-size:12px">' +
+      (err instanceof Error ? err.stack || err.message : String(err)) +
+      '</pre></div>';
+  }
 })();
 </script>
 </body>

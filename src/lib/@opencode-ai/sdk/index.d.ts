@@ -1,0 +1,93 @@
+// ── @opencode-ai/sdk 类型声明 ─────────────────────────────────────────────
+// 运行时实现在同目录的 index.mjs
+// 通过 OpenCode 2.0 `lildax service` 提供 Agent 能力
+
+export interface StreamChunk {
+  type: string;
+  [key: string]: unknown;
+}
+
+export interface HealthResponse {
+  data: { healthy: boolean };
+}
+
+export interface SessionCreateResponse {
+  data: { id: string; title?: string };
+}
+
+export interface SessionPromptBody {
+  model?: string;
+  parts?: Array<{ type: string; text: string }>;
+  text?: string;
+}
+
+export interface PromptOptions {
+  path: { id: string };
+  body: SessionPromptBody;
+}
+
+export interface SessionClient {
+  create(body: { body: { title?: string; model?: string } }): Promise<SessionCreateResponse>;
+  get?(sessionId: string): Promise<{ data: { id: string } | null }>;
+  prompt(options: PromptOptions): AsyncIterable<StreamChunk>;
+  switchModel?(sessionId: string, modelRef: { providerID: string; id: string }): Promise<void>;
+}
+
+export interface GlobalClient {
+  health(): Promise<HealthResponse>;
+}
+
+export interface OpencodeClient {
+  global: GlobalClient;
+  session: SessionClient;
+}
+
+export type PermissionReply = "once" | "always" | "reject";
+
+export interface PermissionRequest {
+  id: string;
+  sessionID?: string;
+  action?: string;
+  resources?: string[];
+  save?: string[];
+  source?: {
+    type?: string;
+    messageID?: string;
+    callID?: string;
+  };
+}
+
+export interface CreateOpencodeOptions {
+  hostname?: string;
+  port?: number;
+  /** 启动超时（毫秒），默认 30000 */
+  timeout?: number;
+  config?: { cwd?: string };
+  env?: NodeJS.ProcessEnv;
+  /** 指定 CLI 可执行名或绝对路径；不填则自动检测 opencode / lildax */
+  cli?: string;
+  /** CLI 对应 npm 包名，用于错误提示 */
+  cliPackage?: string;
+  /** 子进程 stderr 输出的回调，扩展层可写入日志通道 */
+  onStderr?: (text: string) => void;
+  /** 流程诊断日志回调 */
+  onLog?: (message: string) => void;
+  /** OpenCode 工具权限确认（write/edit/bash 等需要 ask 时） */
+  onPermission?: (request: PermissionRequest) => Promise<PermissionReply>;
+}
+
+export interface OpencodeServerInstance {
+  server: {
+    close(): Promise<void>;
+  };
+  client: OpencodeClient;
+}
+
+/**
+ * 连接 OpenCode 2.0 后台 service，返回 client。
+ *
+ * 要求 `opencode` / `lildax` CLI 必须在 PATH 上（npm install -g @opencode-ai/cli）。
+ */
+export function createOpencode(
+  options: CreateOpencodeOptions
+): Promise<OpencodeServerInstance>;

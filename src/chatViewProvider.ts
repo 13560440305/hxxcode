@@ -870,7 +870,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     margin-top: 48px;
   }
 
-  .msg-row { display: flex; gap: 8px; align-items: flex-start; animation: fadeIn 0.2s ease; }
+  .msg-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    animation: fadeIn 0.2s ease;
+    max-width: 100%;
+  }
+  .msg-row.assistant {
+    align-self: flex-start;
+    flex-direction: row;
+  }
+  .msg-row.user {
+    align-self: flex-end;
+    flex-direction: row-reverse;
+    max-width: 88%;
+  }
   @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 
   .avatar {
@@ -885,6 +900,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .avatar.ai { background: var(--accent-soft); color: var(--accent); }
 
   .msg-body { flex: 1; min-width: 0; }
+  .msg-row.user .msg-body { text-align: right; }
+  .msg-row.user .msg-body pre,
+  .msg-row.user .msg-body pre code { text-align: left; }
   .msg-body p { margin: 6px 0; line-height: 1.55; }
   .msg-body p:first-child { margin-top: 0; }
   .msg-body p:last-child { margin-bottom: 0; }

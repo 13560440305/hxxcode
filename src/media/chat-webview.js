@@ -154,7 +154,7 @@
 
       for (const msg of state.messages) {
         const row = document.createElement("div");
-        row.className = "msg-row";
+        row.className = "msg-row " + (msg.role === "user" ? "user" : "assistant");
 
         // 头像
         const avatar = document.createElement("div");
