@@ -116,6 +116,12 @@ export class SettingsPanel {
         ChatViewProvider.notifyProviderChanged();
         break;
       }
+
+      case "openUrl": {
+        const { url } = message.payload as { url: string };
+        vscode.env.openExternal(vscode.Uri.parse(url));
+        break;
+      }
     }
   }
 
@@ -367,6 +373,14 @@ export class SettingsPanel {
     background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 3px;
   }
   .key-toggle:hover { color: var(--text); }
+  .url-wrap { position: relative; }
+  .url-wrap input { width: 100%; padding-right: 32px; font-family: var(--mono-font); }
+  .url-open-btn {
+    position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
+    background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 3px;
+    display: flex; align-items: center;
+  }
+  .url-open-btn:hover { color: var(--accent); }
 
   .section-title {
     font-size: 12px; font-weight: 700;
@@ -534,7 +548,12 @@ export class SettingsPanel {
         <div class="form-grid full">
           <div class="field">
             <label>Base URL</label>
-            <input type="text" id="editBaseURL" placeholder="https://api.example.com/v1" />
+            <div class="url-wrap">
+              <input type="text" id="editBaseURL" placeholder="https://api.example.com/v1" />
+              <button type="button" class="url-open-btn" id="urlOpenBtn" title="在浏览器中打开">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M12 8.667v4a1.333 1.333 0 0 1-1.333 1.333H3.333A1.333 1.333 0 0 1 2 12.667V5.333A1.333 1.333 0 0 1 3.333 4h4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M10 2h4v4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M6.667 9.333 14 2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+              </button>
+            </div>
           </div>
         </div>
         <div class="form-grid full">
@@ -872,6 +891,12 @@ export class SettingsPanel {
     const input = $("editApiKey");
     if (!input) return;
     input.type = input.type === "password" ? "text" : "password";
+  });
+
+  $("urlOpenBtn")?.addEventListener("click", () => {
+    const url = $("editBaseURL").value.trim();
+    if (!url) { alert("请先填写 Base URL"); return; }
+    vscode.postMessage({ type: "openUrl", payload: { url } });
   });
 
   $("fetchModelsBtn").addEventListener("click", () => {
