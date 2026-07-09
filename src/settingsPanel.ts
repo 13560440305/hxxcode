@@ -15,7 +15,7 @@ export class SettingsPanel {
   static show(
     extensionUri: vscode.Uri,
     providerStore: ProviderStore,
-    opencodeManager: OpencodeManager
+    opencodeManager: OpencodeManager | null
   ) {
     if (SettingsPanel.currentPanel) {
       SettingsPanel.currentPanel.panel.reveal();
@@ -39,7 +39,7 @@ export class SettingsPanel {
     panel: vscode.WebviewPanel,
     private readonly extensionUri: vscode.Uri,
     private readonly providerStore: ProviderStore,
-    private readonly opencodeManager: OpencodeManager
+    private readonly opencodeManager: OpencodeManager | null
   ) {
     this.panel = panel;
     this.panel.webview.html = this.renderHtml();
@@ -82,7 +82,9 @@ export class SettingsPanel {
           apiKey: string;
         };
         await this.providerStore.upsertProvider(config, apiKey);
-        await this.opencodeManager.restart();
+        if (this.opencodeManager) {
+          await this.opencodeManager.restart();
+        }
         vscode.window.showInformationMessage(`供应商「${config.name}」已保存`);
         this.postState();
         ChatViewProvider.notifyProviderChanged();
@@ -92,7 +94,9 @@ export class SettingsPanel {
       case "removeProvider": {
         const { id } = message.payload as { id: string };
         await this.providerStore.removeProvider(id);
-        await this.opencodeManager.restart();
+        if (this.opencodeManager) {
+          await this.opencodeManager.restart();
+        }
         this.postState();
         ChatViewProvider.notifyProviderChanged();
         break;
@@ -103,7 +107,11 @@ export class SettingsPanel {
           providerId: string;
           model: string;
         };
-        await this.opencodeManager.switchModel(providerId, model);
+        if (this.opencodeManager) {
+          await this.opencodeManager.switchModel(providerId, model);
+        } else {
+          await this.providerStore.setActive(providerId, model);
+        }
         this.postState();
         ChatViewProvider.notifyProviderChanged();
         break;

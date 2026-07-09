@@ -11,6 +11,17 @@ export function getHxxCodeDir(): string {
   return path.join(os.homedir(), ".hxxcode");
 }
 
+/** 未打开 VS Code 工作区时，Agent 使用的默认工作目录 */
+export function getDefaultWorkspaceDir(): string {
+  return path.join(getHxxCodeDir(), "default-workspace");
+}
+
+export async function ensureDefaultWorkspaceDir(): Promise<string> {
+  const dir = getDefaultWorkspaceDir();
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+
 export function getSessionsDir(): string {
   return path.join(getHxxCodeDir(), "sessions");
 }

@@ -7,8 +7,10 @@
       "request": "launch",
       "title": "启动 Extension Development Host",
       "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}/src"
+        "--extensionDevelopmentPath=${workspaceFolder}/src",
+        "${workspaceFolder}"
       ],
+      "cwd": "${workspaceFolder}",
       "outFiles": [
         "${workspaceFolder}/src/out/**/*.js"
       ],

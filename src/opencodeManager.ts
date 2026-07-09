@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as fs from "fs/promises";
 import type { OpencodeClient, PermissionReply, PermissionRequest } from "@opencode-ai/sdk";
 import { ProviderStore, buildOpencodeProviderConfig, envVarName } from "./providerStore";
-import { log, showDiag } from "./log";
+import { log, logError, isDebugEnabled } from "./log";
 import { getOpencodeConfigPath, ensureOpencodeDirs, readJSON } from "./storage";
 
 // ── Stream event types ───────────────────────────────────────────────────────
@@ -45,6 +45,7 @@ export class OpencodeManager implements vscode.Disposable {
     null;
   private client: OpencodeClient | null = null;
   private starting: Promise<void> | null = null;
+  private forceServiceRestart = false;
   private permissionHandler:
     | ((request: PermissionRequest) => Promise<PermissionReply>)
     | null = null;
@@ -67,6 +68,7 @@ export class OpencodeManager implements vscode.Disposable {
   }
 
   private flow(step: string, detail?: unknown): void {
+    if (!isDebugEnabled()) return;
     const msg = detail !== undefined ? `${step} ${typeof detail === "string" ? detail : JSON.stringify(detail)}` : step;
     log("[flow/opencode]", msg);
   }
@@ -84,13 +86,19 @@ export class OpencodeManager implements vscode.Disposable {
     this.flow("buildEnv", { keys: envKeys, hasKeys: envKeys.length > 0 });
 
     const { createOpencode } = await import("@opencode-ai/sdk");
+    const sdkLog = isDebugEnabled() ? (msg: string) => log("[opencode/sdk]", msg) : undefined;
+    const sdkStderr = isDebugEnabled()
+      ? (text: string) => log("[opencode/stderr]", text.trimEnd())
+      : undefined;
     this.server = await createOpencode({
       config: { cwd: this.workspaceRoot },
       env,
       cli: agentBackend.command,
       cliPackage: agentBackend.npmPackage,
-      onStderr: (text) => log("[opencode/stderr]", text.trimEnd()),
-      onLog: (msg) => log("[opencode/sdk]", msg),
+      restartService: this.forceServiceRestart,
+      timeout: process.platform === "win32" ? 90_000 : 45_000,
+      onStderr: sdkStderr,
+      onLog: sdkLog,
       onPermission: (request) => this.handlePermissionRequest(request),
     });
     this.client = this.server.client;
@@ -104,8 +112,13 @@ export class OpencodeManager implements vscode.Disposable {
 
   /** 供应商增删改后调用：重写配置文件并重启子进程 */
   async restart(): Promise<void> {
-    await this.stop();
-    await this.start();
+    this.forceServiceRestart = true;
+    try {
+      await this.stop();
+      await this.start();
+    } finally {
+      this.forceServiceRestart = false;
+    }
   }
 
   async stop(): Promise<void> {

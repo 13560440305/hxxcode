@@ -4,7 +4,7 @@ import * as fs from "fs/promises";
 import { OpencodeManager, StreamEvent } from "./opencodeManager";
 import type { PermissionReply, PermissionRequest } from "@opencode-ai/sdk";
 import { ProviderStore, ProviderConfig } from "./providerStore";
-import { log, showDiag } from "./log";
+import { logError } from "./log";
 import { getSessionsDir, getSessionPath, ensureDirs, readJSON } from "./storage";
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -45,6 +45,7 @@ type WebviewMessage =
   | { type: "deleteSession"; payload: { sessionId: string } }
   | { type: "retryLastMessage" }
   | { type: "openSettings" }
+  | { type: "openFile"; payload: { path: string } }
   | { type: "requestState" }
   | { type: "permissionReply"; payload: { id: string; reply: PermissionReply } };
 
@@ -129,6 +130,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ChatViewProvider._instance?.postState();
   }
 
+  static attachOpencodeManager(manager: OpencodeManager): void {
+    ChatViewProvider._instance?.bindOpencodeManager(manager);
+  }
+
+  private bindOpencodeManager(manager: OpencodeManager): void {
+    manager.setPermissionHandler((req) => this.requestPermissionInWebview(req));
+  }
+
   private _view?: vscode.WebviewView;
   private sessions: SessionData[] = [];
   private activeSessionId: string | null = null;
@@ -139,11 +148,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   constructor(
     private readonly extensionUri: vscode.Uri,
-    private readonly opencodeManager: OpencodeManager,
-    private readonly providerStore: ProviderStore
+    private readonly getOpencodeManager: () => OpencodeManager | null,
+    private readonly getProviderStore: () => ProviderStore | null,
+    private readonly ensureInitialized: () => Promise<boolean>
   ) {
     ChatViewProvider._instance = this;
-    this.opencodeManager.setPermissionHandler((req) => this.requestPermissionInWebview(req));
+  }
+
+  private requireOpencodeManager(): OpencodeManager {
+    const manager = this.getOpencodeManager();
+    if (!manager) {
+      throw new Error("HxxCode Agent 尚未启动，请检查 CLI 是否已安装");
+    }
+    return manager;
   }
 
   resolveWebviewView(
@@ -151,7 +168,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     _context: vscode.WebviewViewResolveContext,
     _token: vscode.CancellationToken
   ): void {
-    log("resolveWebviewView 被调用");
     this._view = webviewView;
 
     webviewView.webview.options = {
@@ -160,45 +176,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
 
     webviewView.webview.onDidReceiveMessage((msg: WebviewMessage) => {
-      log("收到 webview 消息:", msg.type);
       void this.handleMessage(msg);
     });
 
-    // 当视图重新变为可见时（如从设置面板切回），刷新最新 state
     webviewView.onDidChangeVisibility(() => {
-      log("视图可见性变化:", webviewView.visible);
-      if (webviewView.visible) {
-        if (!this.webviewReady) {
-          log("webview 可见但未 ready，重新渲染 HTML");
-          this.setWebviewHtml(webviewView);
-        }
+      if (webviewView.visible && this.webviewReady) {
         this.postState();
       }
     });
 
-    void this.initWebview(webviewView);
+    // 立即渲染 UI 壳，不等待 Agent / 会话加载
+    this.setWebviewHtml(webviewView);
+    void this.bootstrapWebview();
   }
 
-  /** 先加载会话数据，再渲染 webview（内嵌 boot state） */
-  private async initWebview(webviewView: vscode.WebviewView): Promise<void> {
-    this.webviewReady = false;
-
-    await this.loadSessionsFromDisk();
-
-    if (this.sessions.length === 0) {
-      log("会话列表为空，创建新会话");
-      try {
-        await this.createSession();
-      } catch (err) {
-        const msg = (err as Error).message;
-        log("createSession 失败:", msg);
-        this.postError(`创建会话失败: ${msg}`);
+  /** 后台加载会话数据并刷新 state */
+  private async bootstrapWebview(): Promise<void> {
+    try {
+      if (!(await this.ensureInitialized())) {
+        this.postState();
+        return;
       }
-    } else {
-      log("已有会话:", this.sessions.length);
-    }
 
-    this.setWebviewHtml(webviewView);
+      await this.loadSessionsFromDisk();
+
+      if (this.sessions.length === 0) {
+        this.createLocalSession();
+      }
+
+      this.postState();
+    } catch (err) {
+      logError("侧栏初始化失败:", (err as Error).message);
+      this.postError(`初始化失败: ${(err as Error).message}`);
+    }
   }
 
   private setWebviewHtml(webviewView: vscode.WebviewView): void {
@@ -207,27 +217,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       webviewView.webview,
       this.buildStatePayload()
     );
-    log(
-      "webview HTML 已渲染, sessions:",
-      this.sessions.length,
-      "providers:",
-      this.providerStore.list().length
-    );
   }
 
   // ── 向 Webview 发送消息 ─────────────────────────────────────────────────
 
   private postMessage(msg: Record<string, unknown>): void {
-    log("postMessage:", msg.type, msg.type === "state" ? JSON.stringify(msg.payload).slice(0, 200) + "..." : "");
     this._view?.webview.postMessage(msg);
   }
 
   private postError(message: string): void {
-    log("postError:", message);
     this.postMessage({ type: "error", payload: { message } });
   }
 
   private buildStatePayload() {
+    const providerStore = this.getProviderStore();
+    if (!providerStore) {
+      return {
+        sessions: [],
+        activeSessionId: null,
+        messages: [],
+        providers: [],
+        activeProviderId: null,
+        activeModel: null,
+        isStreaming: false,
+      };
+    }
+
     // activeSessionId 可能与 session.info.id 不一致（例如 OpenCode 返回了新 id）
     if (
       this.activeSessionId &&
@@ -237,7 +252,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     const session = this.getActiveSession();
-    const { provider, model } = this.providerStore.getActive();
+    const { provider, model } = providerStore.getActive();
 
     return {
       sessions: [...this.sessions]
@@ -245,7 +260,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .map((s) => s.info),
       activeSessionId: this.activeSessionId,
       messages: session?.messages ?? [],
-      providers: this.providerStore.list(),
+      providers: providerStore.list(),
       activeProviderId: provider?.id ?? null,
       activeModel: model,
       isStreaming: !!this.abortController,
@@ -253,26 +268,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private postState(): void {
-    const payload = this.buildStatePayload();
-
-    log("postState — sessions:", this.sessions.length, "providers:", this.providerStore.list().length);
-    log("  activeSessionId:", payload.activeSessionId);
-    log("  provider:", payload.activeProviderId, "model:", payload.activeModel);
-    log("  providerStore.list():", JSON.stringify(payload.providers.map(p => ({ id: p.id, name: p.name, models: p.models, isDefault: p.isDefault }))));
-    log("  messages:", payload.messages.length);
-    log("  webviewReady:", this.webviewReady);
-
-    if (!this.webviewReady) {
-      log("  webview 尚未 ready，state 将在 ready 后重发");
-    }
-
-    this.postMessage({ type: "state", payload });
+    this.postMessage({ type: "state", payload: this.buildStatePayload() });
   }
 
   // ── 消息处理 ──────────────────────────────────────────────────────────────
 
   private async handleMessage(msg: WebviewMessage): Promise<void> {
-    log("handleMessage:", msg.type);
     switch (msg.type) {
       case "ready":
         this.webviewReady = true;
@@ -284,7 +285,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
 
       case "createSession":
-        await this.createSession();
+        this.createLocalSession();
+        this.postState();
+        void this.saveSessionsToDisk();
         break;
 
       case "switchSession":
@@ -294,7 +297,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "switchModel":
         try {
-          await this.opencodeManager.switchModel(
+          if (!(await this.ensureInitialized())) {
+            this.postError("HxxCode 尚未就绪，请稍后重试");
+            break;
+          }
+          await this.requireOpencodeManager().switchModel(
             msg.payload.providerId,
             msg.payload.model
           );
@@ -319,6 +326,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "openSettings":
         vscode.commands.executeCommand("opencodeBridge.openSettings");
         break;
+
+      case "openFile": {
+        const filePath = msg.payload.path?.trim();
+        if (filePath) {
+          const uri = vscode.Uri.file(filePath);
+          void vscode.window.showTextDocument(uri, {
+            preview: false,
+            viewColumn: vscode.ViewColumn.One,
+          });
+        }
+        break;
+      }
 
       case "requestState":
         this.postState();
@@ -377,7 +396,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       (a, b) => b.info.createdAt - a.info.createdAt
     );
     if (this.sessions.length < before) {
-      log("consolidateEmptySessions: 移除", before - this.sessions.length, "个重复空会话");
       if (
         this.activeSessionId &&
         !this.sessions.some((s) => s.info.id === this.activeSessionId)
@@ -388,9 +406,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async createSession(): Promise<string> {
+  /** 仅创建本地会话，不阻塞等待 Agent */
+  private createLocalSession(): string {
     const id = shortId();
-    log("createSession, id:", id, "total:", this.sessions.length + 1);
     const session: SessionData = {
       info: {
         id,
@@ -399,21 +417,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
       messages: [],
     };
-
     this.sessions.push(session);
     this.activeSessionId = id;
-    this.postState();
-
-    const result = await this.opencodeManager.createSession(session.info.title);
-    const oldId = session.info.id;
-    session.info.id = result.id;
-    if (this.activeSessionId === oldId) {
-      this.activeSessionId = result.id;
-    }
-    this.postState();
-    void this.saveSessionsToDisk();
-
-    return session.info.id;
+    return id;
   }
 
   private deleteSession(sessionId: string): void {
@@ -452,7 +458,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
         }
       }
-      log("loadSessionsFromDisk: 加载了", this.sessions.length, "个会话");
       if (this.sessions.length > 0) {
         this.consolidateEmptySessions();
         this.renumberSessionTitles();
@@ -460,10 +465,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.activeSessionId = this.sessions[0]?.info.id ?? null;
         }
         void this.saveSessionsToDisk();
-        this.postState();
       }
     } catch (err) {
-      log("loadSessionsFromDisk 出错:", String(err));
+      logError("加载会话历史失败:", String(err));
     }
   }
 
@@ -485,33 +489,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await fs.writeFile(filePath, JSON.stringify(session, null, 2), "utf-8");
       }
     } catch (err) {
-      log("saveSessionsToDisk 出错:", String(err));
+      logError("保存会话失败:", String(err));
     }
   }
 
   // ── 发送消息 ──────────────────────────────────────────────────────────────
 
   private async handleSendMessage(text: string): Promise<void> {
-    showDiag();
-    const flowT0 = Date.now();
-    const flow = (step: string, detail?: unknown) => {
-      const elapsed = Date.now() - flowT0;
-      log(`[flow/send +${elapsed}ms] ${step}`, detail ?? "");
-    };
-
-    flow("用户点击发送", { textLen: text.length, preview: text.slice(0, 60) });
+    if (!(await this.ensureInitialized())) {
+      this.postError("HxxCode 尚未就绪，请稍后重试");
+      return;
+    }
 
     let session = this.getActiveSession();
     if (!session) {
-      flow("无活跃 session，创建新 session");
-      await this.createSession();
+      this.createLocalSession();
       session = this.getActiveSession();
       if (!session) {
-        flow("✗ 创建 session 失败");
         return;
       }
     }
-    flow("活跃 session", { id: session.info.id, title: session.info.title });
 
     // 追加用户消息
     session.messages.push({
@@ -540,35 +537,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.abortController = new AbortController();
 
     try {
-      flow("ensureBackendSession 开始");
-      const backendId = await this.opencodeManager.ensureBackendSession(
+      const backendId = await this.requireOpencodeManager().ensureBackendSession(
         session.info.id,
         session.info.title
       );
-      flow("ensureBackendSession 完成", { backendId });
       if (backendId !== session.info.id) {
-        flow("session ID 已更新", { from: session.info.id, to: backendId });
+        const oldId = session.info.id;
         session.info.id = backendId;
+        if (this.activeSessionId === oldId) {
+          this.activeSessionId = backendId;
+        }
         this.postState();
         void this.saveSessionsToDisk();
       }
 
-      flow("promptStream 开始");
-      await this.opencodeManager.promptStream(
+      await this.requireOpencodeManager().promptStream(
         backendId,
         text,
         (event) => {
-          if (event.type !== "text") {
-            flow("收到事件", { type: event.type, error: event.error });
-          }
           this.handleStreamEvent(session!.info.id, event);
         },
         this.abortController.signal
       );
-      flow("promptStream 返回");
     } catch (err) {
       const msg = (err as Error).message;
-      flow("✗ 发送失败", msg);
       if (
         msg.includes("aborted") ||
         msg.includes("cancel") ||
@@ -580,7 +572,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         assistantMsg.text += `\n\n**错误**: ${msg}`;
       }
     } finally {
-      flow("发送流程结束", { totalMs: Date.now() - flowT0 });
       assistantMsg.isStreaming = false;
       this.abortController = null;
       this.postState();
@@ -992,6 +983,115 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     white-space: pre-wrap;
   }
   .tool-card.open .tool-card-body { display: block; }
+
+  /* ── Tool group (Cursor-style file list) ── */
+  .tool-group {
+    margin: 6px 0;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: color-mix(in srgb, var(--bg) 96%, var(--accent));
+  }
+  .tool-group-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .tool-group-header:hover { background: var(--surface-hover); }
+  .tool-group-header .chevron {
+    font-size: 9px;
+    color: var(--muted);
+    transition: transform 0.15s;
+    flex: 0 0 auto;
+  }
+  .tool-group.open .tool-group-header .chevron { transform: rotate(90deg); }
+  .tool-group-title {
+    flex: 1;
+    font-size: 12px;
+    font-weight: 500;
+    min-width: 0;
+  }
+  .tool-group-body {
+    display: none;
+    border-top: 1px solid var(--border-subtle);
+    padding: 4px 0;
+  }
+  .tool-group.open .tool-group-body { display: block; }
+  .file-change-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px 5px 12px;
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  .file-change-item.clickable {
+    cursor: pointer;
+  }
+  .file-change-item.clickable:hover {
+    background: var(--surface-hover);
+  }
+  .file-badge {
+    flex: 0 0 auto;
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 700;
+    font-family: var(--mono-font);
+  }
+  .file-badge.modified { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+  .file-badge.created { background: color-mix(in srgb, var(--ok) 20%, transparent); color: var(--ok); }
+  .file-badge.read { background: color-mix(in srgb, var(--link-fg) 16%, transparent); color: var(--link-fg); }
+  .file-badge.search { background: color-mix(in srgb, var(--muted) 16%, transparent); color: var(--muted); }
+  .file-badge.command { background: color-mix(in srgb, var(--muted) 12%, transparent); color: var(--muted); }
+  .file-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .file-name {
+    font-family: var(--mono-font);
+    font-size: 11.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .file-change-item.clickable .file-name { color: var(--link-fg); }
+  .file-meta {
+    font-size: 10.5px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .file-stats {
+    flex: 0 0 auto;
+    font-family: var(--mono-font);
+    font-size: 10.5px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .file-stats.add { color: var(--ok); }
+  .file-stats.del { color: var(--err); }
+  .file-stats .add-part { color: var(--ok); }
+  .file-stats .del-part { color: var(--err); }
+  .tool-group-section {
+    padding: 4px 10px 2px 12px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
 
   /* ── Permission panel ── */
   .permission-panel {

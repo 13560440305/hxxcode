@@ -1,0 +1,10 @@
+# VSIX build output
+*.vsix
+
+# Source build output
+src/out/
+src/node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db

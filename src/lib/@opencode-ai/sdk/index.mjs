@@ -7,7 +7,7 @@ import { createServer } from "node:net";
 
 const CLI_CANDIDATES = ["opencode", "lildax"];
 const DEFAULT_SERVE_PORT = 4096;
-const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
+const DEFAULT_STARTUP_TIMEOUT_MS = process.platform === "win32" ? 90_000 : 45_000;
 const SERVE_HOST = "127.0.0.1";
 
 /** OpenCode 2.0 预览版 (lildax) */
@@ -52,17 +52,9 @@ async function detectCli(log) {
 /** 使用配置指定的 CLI，或自动检测 */
 async function resolveCli(log, preferred, npmPackage) {
   if (preferred) {
-    try {
-      await runCli(preferred, ["--version"], { log });
-      log(`使用配置的 Agent CLI: ${preferred}`);
-      return preferred;
-    } catch (err) {
-      const pkgHint = npmPackage ? `npm install -g ${npmPackage}` : "请检查 PATH";
-      throw new Error(
-        `配置的 Agent CLI「${preferred}」不可用：${err.message}\n\n` +
-          `可在 ~/.hxxcode/config.json 的 agentBackend 中修改 command，或安装对应 CLI：${pkgHint}`
-      );
-    }
+    // 跳过 --version：Windows 上每次 CLI 调用约 2s+，启动阶段尽量复用已有 service
+    log(`使用配置的 Agent CLI: ${preferred}`);
+    return preferred;
   }
   return detectCli(log);
 }
@@ -276,6 +268,8 @@ function stripAnsi(text) {
 
 // ── 检测 CLI 是否有 service 子命令 ─────────────────────────────────────
 async function hasServiceSubcommand(cli, options) {
+  // lildax 是 OpenCode 2.0 官方 CLI，固定支持 service 子命令
+  if (cli === "lildax") return true;
   try {
     // 查 `--help` 输出中是否有 "service" 命令条目（避免 `service --help`
     // 在 opencode v1.1.x 上 exit 0 但只输出通用帮助的误判）
@@ -460,13 +454,30 @@ async function ensureServiceViaSubcommand(cli, options) {
   log(`service status: ${preview(status, 80)}`);
 
   let managedLifecycle = "none";
+
   if (/running/i.test(status)) {
     if (options.restartService) {
       log("service 已在运行，执行 restart（注入 env / 刷新配置）");
       await runCli(cli, ["service", "restart"], options);
       managedLifecycle = "restarted";
     } else {
-      log("service 已在运行，复用现有进程");
+      log("service 已在运行，复用现有进程（跳过重启）");
+      const url = parseServiceUrl(status);
+      const password = (await runCli(cli, ["service", "password"], options))
+        .split(/\r?\n/)
+        .pop()
+        .trim();
+      if (!password) {
+        throw new Error("无法获取 OpenCode service 密码");
+      }
+      const profile = await detectApiProfile(url, password, options.cwd, log);
+      if (profile?.id === "v2") {
+        log("── ensureServiceViaSubcommand 完成（复用）──");
+        return { url, password: profile.password, apiProfile: profile, managedLifecycle: "none" };
+      }
+      log("已有 service 健康检查未通过，尝试 restart…");
+      await runCli(cli, ["service", "restart"], options);
+      managedLifecycle = "restarted";
     }
   } else {
     log("service 未运行，执行 start");
@@ -1057,7 +1068,13 @@ export async function createOpencode(options) {
     );
   }
 
-  const runOpts = { cwd: directory, env, onStderr, log, restartService: true };
+  const runOpts = {
+    cwd: directory,
+    env,
+    onStderr,
+    log,
+    restartService: options.restartService ?? false,
+  };
   let managedLifecycle = "none";
   /** serve 模式下的子进程引用，用于关闭 */
   let serveProc = null;

@@ -65,6 +65,11 @@
           "type": "boolean",
           "default": true,
           "description": "打开工作区时自动启动 HxxCode server"
+        },
+        "opencodeBridge.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "启用 HxxCode 诊断日志（输出到「HxxCode 诊断」面板）"
         }
       }
     }

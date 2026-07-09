@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import { readJSON, writeJSON, getConfigPath, ensureDirs } from "./storage";
-import { log } from "./log";
 import {
   type AgentBackendCustom,
   type AgentBackendDefinition,
@@ -73,11 +72,6 @@ export class ProviderStore {
         ...fileState,
         agentBackend: normalizeAgentBackendSettings(fileState.agentBackend),
       };
-      log("ProviderStore: 从 ~/.hxxcode/config.json 加载", fileState.providers.length, "个供应商");
-      log(
-        "ProviderStore: Agent 后端",
-        resolveActiveAgentBackend(this.state.agentBackend).id
-      );
       return;
     }
 
@@ -98,7 +92,6 @@ export class ProviderStore {
         agentBackend: defaultAgentBackendSettings(),
       };
       await this.persist();
-      log("ProviderStore: 从 VS Code 迁移旧数据完成", oldState.providers.length, "个供应商");
       // 清理旧数据
       await this.context.globalState.update(STATE_KEY, undefined);
       return;
@@ -106,7 +99,6 @@ export class ProviderStore {
 
     // 全新安装，用默认值
     this.state = { ...DEFAULT_STATE };
-    log("ProviderStore: 全新安装，无已有数据");
   }
 
   /** 首次激活时确保存在一个可用的默认供应商（占位） */
@@ -154,7 +146,6 @@ export class ProviderStore {
       activeId: backendId,
     };
     await this.persist();
-    log("ProviderStore: 切换 Agent 后端 →", backendId);
   }
 
   /** 注册或更新用户自定义 Agent 后端（写入 config.json agentBackend.custom） */
@@ -167,7 +158,6 @@ export class ProviderStore {
       },
     };
     await this.persist();
-    log("ProviderStore: 注册自定义 Agent 后端", id);
   }
 
   get(id: string): ProviderConfig | undefined {

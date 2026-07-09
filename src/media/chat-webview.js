@@ -180,9 +180,9 @@
           body.appendChild(cursor);
         }
 
-        // 工具卡片
-        for (const tc of msg.toolCalls || []) {
-          body.appendChild(renderToolCard(tc));
+        // 工具调用 — 合并为 Cursor 风格的折叠文件列表
+        if (msg.toolCalls && msg.toolCalls.length > 0) {
+          body.appendChild(renderToolCallsGroup(msg.toolCalls));
         }
 
         row.appendChild(body);
@@ -192,32 +192,358 @@
       if (wasAtBottom || state.messages.length === 0) scrollToBottom();
     }
 
-    function renderToolCard(tc) {
-      const card = document.createElement("div");
-      card.className = "tool-card";
+    const FILE_MODIFY_TOOLS = new Set([
+      "write",
+      "edit",
+      "search_replace",
+      "apply_patch",
+      "patch",
+      "multiedit",
+    ]);
+    const FILE_READ_TOOLS = new Set(["read"]);
+    const FILE_SEARCH_TOOLS = new Set(["grep", "glob", "list", "ls", "find"]);
+    const SHELL_TOOLS = new Set(["bash", "shell", "run_terminal_cmd"]);
+
+    const ACTION_PRIORITY = {
+      modified: 4,
+      created: 3,
+      search: 2,
+      read: 1,
+      command: 0,
+      other: 0,
+    };
+
+    function parseToolInput(input) {
+      if (!input) return {};
+      if (typeof input === "object") return input;
+      try {
+        return JSON.parse(input);
+      } catch {
+        return { raw: input };
+      }
+    }
+
+    function parseToolResult(result) {
+      if (!result) return null;
+      if (typeof result === "object") return result;
+      try {
+        return JSON.parse(result);
+      } catch {
+        return { raw: String(result) };
+      }
+    }
+
+    function basename(filePath) {
+      if (!filePath) return "";
+      const normalized = String(filePath).replace(/\\/g, "/");
+      const parts = normalized.split("/");
+      return parts[parts.length - 1] || normalized;
+    }
+
+    function dirname(filePath) {
+      if (!filePath) return "";
+      const normalized = String(filePath).replace(/\\/g, "/");
+      const idx = normalized.lastIndexOf("/");
+      return idx >= 0 ? normalized.slice(0, idx) : "";
+    }
+
+    function extractFilePath(toolName, input) {
+      const data = parseToolInput(input);
+      return (
+        data.path ||
+        data.file_path ||
+        data.filePath ||
+        data.file ||
+        data.target_file ||
+        data.relative_workspace_path ||
+        null
+      );
+    }
+
+    function extractCommand(input) {
+      const data = parseToolInput(input);
+      return data.command || data.cmd || data.raw || "";
+    }
+
+    function classifyTool(toolName) {
+      if (toolName === "write") return "created";
+      if (FILE_MODIFY_TOOLS.has(toolName)) return "modified";
+      if (FILE_READ_TOOLS.has(toolName)) return "read";
+      if (FILE_SEARCH_TOOLS.has(toolName)) return "search";
+      if (SHELL_TOOLS.has(toolName)) return "command";
+      return "other";
+    }
+
+    function parseChangeStats(toolName, input, result) {
+      const resultText =
+        typeof result === "string"
+          ? result
+          : result && result.raw
+            ? result.raw
+            : result
+              ? JSON.stringify(result)
+              : "";
+      const diffMatch = resultText.match(/(\+\d+)\s*(-\d+)/);
+      if (diffMatch) {
+        return { label: diffMatch[1] + " " + diffMatch[2], kind: "diff" };
+      }
+
+      const addLines = (resultText.match(/^\+(?!\+\+)/gm) || []).length;
+      const delLines = (resultText.match(/^-(?!--)/gm) || []).length;
+      if (addLines || delLines) {
+        return { label: "+" + addLines + " -" + delLines, kind: "diff" };
+      }
+
+      if (toolName === "write") return { label: "新建", kind: "created" };
+      if (FILE_MODIFY_TOOLS.has(toolName)) return { label: "已修改", kind: "modified" };
+
+      const data = parseToolInput(input);
+      if (toolName === "grep" && data.pattern) {
+        const p = String(data.pattern);
+        return {
+          label: '搜索 "' + (p.length > 28 ? p.slice(0, 28) + "…" : p) + '"',
+          kind: "search",
+        };
+      }
+      if (toolName === "glob" && (data.pattern || data.glob_pattern)) {
+        return { label: "匹配 " + (data.pattern || data.glob_pattern), kind: "search" };
+      }
+      if (toolName === "read") return { label: "已读取", kind: "read" };
+      if (SHELL_TOOLS.has(toolName)) {
+        const cmd = extractCommand(input);
+        return {
+          label: cmd.length > 48 ? cmd.slice(0, 48) + "…" : cmd || "执行命令",
+          kind: "command",
+        };
+      }
+      return { label: "", kind: "other" };
+    }
+
+    function buildToolActivity(toolCalls) {
+      const fileMap = new Map();
+      const commands = [];
+
+      for (const tc of toolCalls) {
+        const kind = classifyTool(tc.name);
+        const filePath = extractFilePath(tc.name, tc.input);
+        const stats = parseChangeStats(tc.name, tc.input, tc.result);
+        const isRunning = !!tc.isRunning;
+
+        if (kind === "command" || (!filePath && kind === "other")) {
+          commands.push({
+            id: tc.id,
+            kind: "command",
+            toolName: tc.name,
+            label: stats.label || tc.name,
+            isRunning,
+          });
+          continue;
+        }
+
+        if (!filePath && kind === "search") {
+          const data = parseToolInput(tc.input);
+          commands.push({
+            id: tc.id,
+            kind: "search",
+            toolName: tc.name,
+            label: stats.label || tc.name,
+            isRunning,
+          });
+          continue;
+        }
+
+        if (!filePath) {
+          commands.push({
+            id: tc.id,
+            kind: kind === "other" ? "command" : kind,
+            toolName: tc.name,
+            label: stats.label || tc.name,
+            isRunning,
+          });
+          continue;
+        }
+
+        const normalizedPath = String(filePath).replace(/\\/g, "/");
+        const actionKind = tc.name === "write" ? "created" : kind;
+        const existing = fileMap.get(normalizedPath);
+        const entry = {
+          id: tc.id,
+          path: filePath,
+          fileName: basename(filePath),
+          dirName: dirname(filePath),
+          kind: actionKind,
+          stats,
+          toolName: tc.name,
+          isRunning,
+        };
+
+        if (!existing) {
+          fileMap.set(normalizedPath, entry);
+          continue;
+        }
+
+        if (ACTION_PRIORITY[actionKind] > ACTION_PRIORITY[existing.kind]) {
+          fileMap.set(normalizedPath, { ...entry, isRunning: existing.isRunning || isRunning });
+        } else if (isRunning) {
+          existing.isRunning = true;
+        }
+      }
+
+      const files = Array.from(fileMap.values()).sort((a, b) => {
+        const prioDiff = ACTION_PRIORITY[b.kind] - ACTION_PRIORITY[a.kind];
+        if (prioDiff !== 0) return prioDiff;
+        return a.fileName.localeCompare(b.fileName);
+      });
+
+      return { files, commands, anyRunning: toolCalls.some((tc) => tc.isRunning) };
+    }
+
+    function renderToolCallsGroup(toolCalls) {
+      const activity = buildToolActivity(toolCalls);
+      const fileCount = activity.files.length;
+      const commandCount = activity.commands.length;
+      const totalCount = fileCount + commandCount;
+
+      const group = document.createElement("div");
+      group.className = "tool-group";
 
       const header = document.createElement("div");
-      header.className = "tool-card-header";
+      header.className = "tool-group-header";
+
+      let title = "";
+      if (fileCount > 0 && commandCount > 0) {
+        title = fileCount + " 个文件 · " + commandCount + " 步操作";
+      } else if (fileCount > 0) {
+        title = fileCount + " 个文件";
+      } else if (commandCount > 0) {
+        title = commandCount + " 步操作";
+      } else {
+        title = totalCount + " 步操作";
+      }
+
       header.innerHTML =
         '<span class="chevron">▶</span>' +
-        '<span class="tname">' + escapeHtml(tc.name) + '</span>' +
-        '<span class="tsummary">' + escapeHtml(tc.input && tc.input.length > 80 ? tc.input.slice(0, 80) + "…" : tc.input || "") + '</span>' +
-        '<span class="status-pill ' + (tc.isRunning ? "running" : "done") + '">' +
-        (tc.isRunning ? "运行中" : "完成") +
+        '<span class="tool-group-title">' + escapeHtml(title) + "</span>" +
+        '<span class="status-pill ' +
+        (activity.anyRunning ? "running" : "done") +
+        '">' +
+        (activity.anyRunning ? "运行中" : "完成") +
         "</span>";
 
       const body = document.createElement("div");
-      body.className = "tool-card-body";
-      body.textContent = tc.result || tc.input || "";
+      body.className = "tool-group-body";
 
-      card.appendChild(header);
-      card.appendChild(body);
+      if (activity.files.length > 0) {
+        if (activity.commands.length > 0) {
+          const section = document.createElement("div");
+          section.className = "tool-group-section";
+          section.textContent = "文件";
+          body.appendChild(section);
+        }
+        for (const file of activity.files) {
+          body.appendChild(renderFileChangeItem(file));
+        }
+      }
+
+      if (activity.commands.length > 0) {
+        if (activity.files.length > 0) {
+          const section = document.createElement("div");
+          section.className = "tool-group-section";
+          section.textContent = "命令";
+          body.appendChild(section);
+        }
+        for (const cmd of activity.commands) {
+          body.appendChild(renderCommandItem(cmd));
+        }
+      }
+
+      group.appendChild(header);
+      group.appendChild(body);
 
       header.addEventListener("click", () => {
-        card.classList.toggle("open");
+        group.classList.toggle("open");
       });
 
-      return card;
+      return group;
+    }
+
+    function renderFileChangeItem(file) {
+      const row = document.createElement("div");
+      row.className = "file-change-item clickable";
+
+      const badgeClass =
+        file.kind === "created"
+          ? "created"
+          : file.kind === "modified"
+            ? "modified"
+            : file.kind === "search"
+              ? "search"
+              : "read";
+      const badgeText =
+        file.kind === "created" ? "+" : file.kind === "modified" ? "M" : file.kind === "search" ? "G" : "R";
+
+      const statsHtml = renderStatsHtml(file.stats);
+
+      row.innerHTML =
+        '<span class="file-badge ' +
+        badgeClass +
+        '">' +
+        badgeText +
+        "</span>" +
+        '<div class="file-info">' +
+        '<span class="file-name" title="' +
+        escapeHtml(file.path) +
+        '">' +
+        escapeHtml(file.fileName) +
+        "</span>" +
+        '<span class="file-meta">' +
+        escapeHtml(file.dirName || file.path) +
+        "</span>" +
+        "</div>" +
+        statsHtml;
+
+      row.addEventListener("click", (e) => {
+        e.stopPropagation();
+        vscode.postMessage({ type: "openFile", payload: { path: file.path } });
+      });
+
+      return row;
+    }
+
+    function renderCommandItem(cmd) {
+      const row = document.createElement("div");
+      row.className = "file-change-item";
+
+      row.innerHTML =
+        '<span class="file-badge command">$</span>' +
+        '<div class="file-info">' +
+        '<span class="file-name">' +
+        escapeHtml(cmd.toolName) +
+        "</span>" +
+        '<span class="file-meta">' +
+        escapeHtml(cmd.label) +
+        "</span>" +
+        "</div>" +
+        (cmd.isRunning
+          ? '<span class="status-pill running">运行中</span>'
+          : '<span class="status-pill done">完成</span>');
+
+      return row;
+    }
+
+    function renderStatsHtml(stats) {
+      if (!stats || !stats.label) return '<span class="file-stats"></span>';
+      if (stats.kind === "diff") {
+        const parts = stats.label.match(/(\+\d+|\-\d+)/g) || [];
+        const html = parts
+          .map((part) => {
+            const cls = part.startsWith("+") ? "add-part" : "del-part";
+            return '<span class="' + cls + '">' + escapeHtml(part) + "</span>";
+          })
+          .join(" ");
+        return '<span class="file-stats">' + html + "</span>";
+      }
+      return '<span class="file-stats">' + escapeHtml(stats.label) + "</span>";
     }
 
     // ── Permission panel ──
@@ -281,11 +607,10 @@
 
     function updateStatusBar() {
       if (statusLeft) {
-        statusLeft.textContent = "sessions: " + state.sessions.length + " · msgs: " + state.messages.length;
+        statusLeft.textContent = "";
       }
       if (statusRight) {
-        const model = state.activeModel || "";
-        statusRight.textContent = model ? "lildax · " + model : "lildax";
+        statusRight.textContent = state.activeModel || "";
       }
     }
 

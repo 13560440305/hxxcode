@@ -4,70 +4,119 @@ import { OpencodeManager } from "./opencodeManager";
 import { SettingsPanel } from "./settingsPanel";
 import { ChatViewProvider } from "./chatViewProvider";
 
-import { log, showDiag } from "./log";
-import { getHxxCodeDir } from "./storage";
+import { initLogging, log, logError, showDiag } from "./log";
+import { getDefaultWorkspaceDir, ensureDefaultWorkspaceDir } from "./storage";
 import { checkCommandExists, detectFirstAvailableBackend } from "./agentBackend";
 
-export async function activate(context: vscode.ExtensionContext) {
-  log("=== HxxCode 扩展激活 ===");
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!workspaceRoot) {
-    log("未找到工作区文件夹，退出激活");
-    vscode.window.showWarningMessage("请先打开一个工作区文件夹再使用 HxxCode 扩展");
+let providerStore: ProviderStore | null = null;
+let opencodeManager: OpencodeManager | null = null;
+let activeWorkspaceRoot = "";
+let agentStartupPromise: Promise<void> | null = null;
+
+function getEffectiveWorkspaceRoot(): string {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? getDefaultWorkspaceDir();
+}
+
+async function startOpencodeManager(
+  context: vscode.ExtensionContext,
+  workspaceRoot: string
+): Promise<void> {
+  if (!providerStore) {
     return;
   }
-  log("工作区路径:", workspaceRoot);
 
-  const providerStore = new ProviderStore(context);
-  await providerStore.ensureDefaultProvider();
-  log("ProviderStore 初始化完成");
-  log("providers:", providerStore.list());
-  log("active:", providerStore.getActive());
-  log("agent backend:", providerStore.getActiveAgentBackend());
-
-  // ── 自动检测可用的 CLI 后端 ──────────────────────────────────────────
-  const currentBackend = providerStore.getActiveAgentBackend();
-  const hasLildax = checkCommandExists("lildax");
-  const hasOpencode = checkCommandExists("opencode");
-
-  // 若配置了 opencode 别名但 lildax 可用，自动切到 lildax
-  if (currentBackend.id === "opencode-ai/cli:opencode" && hasLildax) {
-    log("检测到 lildax 可用，自动从 opencode 别名切换到 lildax");
-    await providerStore.setActiveAgentBackend("opencode-ai/cli");
-    log("agent backend (auto-switched):", providerStore.getActiveAgentBackend());
-  } else if (!checkCommandExists(currentBackend.command)) {
-    const detected = detectFirstAvailableBackend();
-    if (detected) {
-      log(`当前后端的命令「${currentBackend.command}」不可用，自动切换到「${detected}」`);
-      await providerStore.setActiveAgentBackend(detected);
-      log("agent backend (auto-detected):", providerStore.getActiveAgentBackend());
-    } else {
-      log("⚠ 未检测到任何 Agent CLI（lildax / opencode），请安装 @opencode-ai/cli");
-    }
-  } else {
-    log(`Agent CLI「${providerStore.getActiveAgentBackend().command}」可用`);
+  if (opencodeManager) {
+    opencodeManager.dispose();
+    opencodeManager = null;
   }
 
-  if (!hasLildax && hasOpencode) {
-    log("⚠ 仅检测到标准 opencode CLI (v1.x)，HxxCode 需要 OpenCode 2.0 (lildax)。请运行: npm install -g @opencode-ai/cli");
-    void vscode.window.showWarningMessage(
-      "HxxCode 需要 OpenCode 2.0 预览版 (lildax)。当前 opencode 1.x 与扩展不兼容，请运行 npm install -g @opencode-ai/cli，并执行 kill $(lsof -t -i :4096) 释放端口。"
-    );
-  }
-
-  const opencodeManager = new OpencodeManager(context, providerStore, workspaceRoot);
+  opencodeManager = new OpencodeManager(context, providerStore, workspaceRoot);
   context.subscriptions.push(opencodeManager);
+  ChatViewProvider.attachOpencodeManager(opencodeManager);
+
+  await opencodeManager.start().catch((err) => {
+    const msg = (err as Error).message;
+    logError("Agent 启动失败:", msg);
+    void vscode.window.showErrorMessage(`HxxCode 启动失败：${msg}`);
+  });
+}
+
+/** 快速初始化：仅加载配置，不阻塞 UI */
+async function initializeCore(context: vscode.ExtensionContext): Promise<void> {
+  if (providerStore) {
+    return;
+  }
+
+  activeWorkspaceRoot = getEffectiveWorkspaceRoot();
+  if (!vscode.workspace.workspaceFolders?.[0]) {
+    await ensureDefaultWorkspaceDir();
+  }
+
+  providerStore = new ProviderStore(context);
+  await providerStore.ensureDefaultProvider();
+}
+
+/** 后台启动 Agent CLI（耗时操作，不阻塞侧栏渲染） */
+function startAgentInBackground(context: vscode.ExtensionContext): Promise<void> {
+  if (agentStartupPromise) {
+    return agentStartupPromise;
+  }
+
+  agentStartupPromise = (async () => {
+    if (!providerStore) {
+      return;
+    }
+
+    const currentBackend = providerStore.getActiveAgentBackend();
+    const hasLildax = checkCommandExists("lildax");
+    const hasOpencode = checkCommandExists("opencode");
+
+    if (currentBackend.id === "opencode-ai/cli:opencode" && hasLildax) {
+      await providerStore.setActiveAgentBackend("opencode-ai/cli");
+    } else if (!checkCommandExists(currentBackend.command)) {
+      const detected = detectFirstAvailableBackend();
+      if (detected) {
+        await providerStore.setActiveAgentBackend(detected);
+      } else {
+        log("未检测到 Agent CLI（lildax / opencode）");
+      }
+    }
+
+    if (!hasLildax && hasOpencode) {
+      void vscode.window.showWarningMessage(
+        "HxxCode 需要 OpenCode 2.0 预览版 (lildax)。当前 opencode 1.x 与扩展不兼容，请运行 npm install -g @opencode-ai/cli。"
+      );
+    }
+
+    await startOpencodeManager(context, activeWorkspaceRoot);
+  })().finally(() => {
+    agentStartupPromise = null;
+  });
+
+  return agentStartupPromise;
+}
+
+export async function activate(context: vscode.ExtensionContext) {
+  initLogging(context);
 
   context.subscriptions.push(
     vscode.commands.registerCommand("opencodeBridge.openSettings", () => {
+      if (!providerStore) {
+        void vscode.window.showErrorMessage("HxxCode 尚未完成初始化，请稍后重试");
+        return;
+      }
       SettingsPanel.show(context.extensionUri, providerStore, opencodeManager);
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("opencodeBridge.startServer", async () => {
+      if (!providerStore) {
+        void vscode.window.showErrorMessage("HxxCode 尚未完成初始化，请稍后重试");
+        return;
+      }
       try {
-        await opencodeManager.start();
+        await startAgentInBackground(context);
         vscode.window.showInformationMessage("HxxCode server 已启动");
       } catch (err) {
         vscode.window.showErrorMessage(`启动失败：${(err as Error).message}`);
@@ -75,18 +124,20 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // 注册诊断命令
   context.subscriptions.push(
     vscode.commands.registerCommand("opencodeBridge.showDiag", () => {
       showDiag();
     })
   );
 
-  // 注册聊天侧栏面板
   const chatViewProvider = new ChatViewProvider(
     context.extensionUri,
-    opencodeManager,
-    providerStore
+    () => opencodeManager,
+    () => providerStore,
+    async () => {
+      await initializeCore(context);
+      return !!providerStore;
+    }
   );
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider, {
@@ -94,15 +145,23 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // 启动 OpenCode Server（需要 lildax CLI 在 PATH 上）
-  await opencodeManager.start().catch((err) => {
-    const msg = (err as Error).message;
-    log("opencodeManager.start() 失败:", msg);
-    void vscode.window.showErrorMessage(`HxxCode 启动失败：${msg}`);
-  });
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+      const nextRoot = getEffectiveWorkspaceRoot();
+      if (!providerStore || nextRoot === activeWorkspaceRoot) {
+        return;
+      }
+      activeWorkspaceRoot = nextRoot;
+      await startOpencodeManager(context, nextRoot);
+    })
+  );
 
-  log("数据目录:", getHxxCodeDir());
-  log("=== HxxCode 扩展激活完成 ===");
+  // 仅等待轻量配置加载，Agent 在后台启动
+  await initializeCore(context);
+  const autoStart = vscode.workspace.getConfiguration("opencodeBridge").get<boolean>("autoStart", true);
+  if (autoStart) {
+    void startAgentInBackground(context);
+  }
 }
 
 export function deactivate() {

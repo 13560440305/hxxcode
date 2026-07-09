@@ -60,8 +60,10 @@ export interface PermissionRequest {
 export interface CreateOpencodeOptions {
   hostname?: string;
   port?: number;
-  /** 启动超时（毫秒），默认 30000 */
+  /** 启动超时（毫秒），Windows 默认 90000，其它平台 45000 */
   timeout?: number;
+  /** 为 true 时重启已在运行的 service（供应商变更后使用）；默认 false 以加快启动 */
+  restartService?: boolean;
   config?: { cwd?: string };
   env?: NodeJS.ProcessEnv;
   /** 指定 CLI 可执行名或绝对路径；不填则自动检测 opencode / lildax */

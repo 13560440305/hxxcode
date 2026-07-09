@@ -1,0 +1,17 @@
+.vscode/**
+.vscode-test/**
+.gitignore
+*.vsix
+*.ts
+node_modules/**
+package-lock.json
+tsconfig.json
+foo-perm-test.txt
+scripts/**
+docs/**
+third-parts/**
+LICENSE
+# esbuild 已 bundle 进 out/extension.js，无需单独打包 lib
+lib/**
+# 保留 media 目录
+!media/**

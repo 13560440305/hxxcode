@@ -1,0 +1,18 @@
+# Auto-detect text files, ensure LF in repo
+* text=auto
+
+# Ensure LF for all code files
+*.ts text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.jsonc text eol=lf
+*.md text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.svg text eol=lf
+
+# Media/binary
+*.png binary
+*.vsix binary
+*.exe binary
