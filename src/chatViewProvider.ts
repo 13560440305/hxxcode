@@ -1,18 +1,39 @@
 import * as vscode from "vscode";
-import * as path from "path";
-import * as fs from "fs/promises";
 import { OpencodeManager, StreamEvent } from "./opencodeManager";
 import type { PermissionReply, PermissionRequest } from "@opencode-ai/sdk";
 import { ProviderStore, ProviderConfig } from "./providerStore";
-import { logError } from "./log";
-import { getSessionsDir, getSessionPath, ensureDirs, readJSON } from "./storage";
+import { logError, log } from "./log";
+import {
+  ensureDirs,
+  getSessionPath,
+  getArchiveSessionPath,
+  getSessionsDir,
+  loadSessionIndex,
+  saveSessionIndex,
+  archiveSessionFile,
+  loadSessionMessages,
+  readJSON,
+  SessionIndexEntry,
+} from "./storage";
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
-interface SessionInfo {
+/** 会话元数据（轻量，传给前端渲染列表用） */
+interface SessionMeta {
   id: string;
   title: string;
   createdAt: number;
+  messageCount: number;
+  lastPreview: string;
+}
+
+/** 发往前端的会话列表项 */
+interface SessionListItem {
+  id: string;
+  title: string;
+  createdAt: number;
+  messageCount: number;
+  lastPreview: string;
 }
 
 interface ToolCallDisplay {
@@ -30,9 +51,24 @@ interface ChatMessage {
   isStreaming: boolean;
 }
 
+/** 完整会话数据（仅在活跃时加载 messages） */
 interface SessionData {
-  info: SessionInfo;
+  info: SessionMeta;
   messages: ChatMessage[];
+}
+
+// ── 会话数量/消息上限 ─────────────────────────────────────────────────────
+
+const MAX_ACTIVE_SESSIONS = 50;
+const MAX_SESSION_MESSAGES = 100;
+const ARCHIVE_AGE_DAYS = 30;
+
+function lastMessagePreview(messages: ChatMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const t = messages[i].text?.trim();
+    if (t) return t.slice(0, 80);
+  }
+  return "";
 }
 
 type WebviewMessage =
@@ -234,14 +270,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postMessage({ type: "error", payload: { message } });
   }
 
+  private buildSessionListItems(): SessionListItem[] {
+    return [...this.sessions]
+      .sort((a, b) => b.info.createdAt - a.info.createdAt)
+      .map((s) => ({
+        id: s.info.id,
+        title: s.info.title,
+        createdAt: s.info.createdAt,
+        messageCount: s.info.messageCount,
+        lastPreview: s.info.lastPreview,
+      }));
+  }
+
   private buildStatePayload() {
     const providerStore = this.getProviderStore();
     if (!providerStore) {
       return {
-        sessions: [],
+        sessionList: [] as SessionListItem[],
         activeSessionId: null,
-        messages: [],
-        providers: [],
+        messages: [] as ChatMessage[],
+        providers: [] as ProviderConfig[],
         activeProviderId: null,
         activeModel: null,
         isStreaming: false,
@@ -260,9 +308,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const { provider, model } = providerStore.getActive();
 
     return {
-      sessions: [...this.sessions]
-        .sort((a, b) => b.info.createdAt - a.info.createdAt)
-        .map((s) => s.info),
+      sessionList: this.buildSessionListItems(),
       activeSessionId: this.activeSessionId,
       messages: session?.messages ?? [],
       providers: providerStore.list(),
@@ -294,8 +340,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
 
       case "switchSession":
-        this.activeSessionId = msg.payload.sessionId;
-        this.postState();
+        {
+          const newId = msg.payload.sessionId;
+          if (!this.activeSessionId || newId !== this.activeSessionId) {
+            this.activeSessionId = newId;
+            // 懒加载：如果当前 session 的 messages 为空，从磁盘按需加载
+            const session = this.getActiveSession();
+            if (session && session.messages.length === 0) {
+              const loadedMsgs = await this.loadMessagesForSession(newId);
+              if (loadedMsgs && loadedMsgs.length > 0) {
+                session.messages = loadedMsgs;
+              }
+            }
+            this.postState();
+          }
+        }
         break;
 
       case "switchModel":
@@ -412,16 +471,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 仅创建本地会话，不阻塞等待 Agent */
   private createLocalSession(): string {
     const id = shortId();
+    const now = Date.now();
     const session: SessionData = {
       info: {
         id,
         title: this.nextSessionTitle(),
-        createdAt: Date.now(),
+        createdAt: now,
+        messageCount: 0,
+        lastPreview: "",
       },
       messages: [],
     };
     this.sessions.push(session);
     this.activeSessionId = id;
+
+    // 主动清理：确保不超过上限
+    void this.housekeepSessions();
     return id;
   }
 
@@ -459,52 +524,202 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.sessionsLoaded = true;
     try {
       await ensureDirs();
-      const sessionsDir = getSessionsDir();
-      const files = await fs.readdir(sessionsDir);
-      const jsonFiles = files.filter((f) => f.endsWith(".json")).sort();
 
-      for (const file of jsonFiles) {
-        const data = await readJSON<SessionData | null>(
-          path.join(sessionsDir, file),
-          null
-        );
-        if (data && data.info && data.messages) {
-          // 避免和当前活跃会话重复
-          if (!this.sessions.find((s) => s.info.id === data.info.id)) {
-            this.sessions.push(data);
+      // ── 优先从索引文件加载（单文件读取，O(1)） ──
+      const index = await loadSessionIndex();
+      if (index.length > 0) {
+        // 只加载活跃会话的元数据，不加载 messages
+        const activeEntries = index
+          .filter((e) => !e.archived)
+          .sort((a, b) => b.createdAt - a.createdAt);
+        for (const entry of activeEntries) {
+          this.sessions.push({
+            info: {
+              id: entry.id,
+              title: entry.title,
+              createdAt: entry.createdAt,
+              messageCount: entry.messageCount,
+              lastPreview: entry.lastPreview,
+            },
+            messages: [], // 懒加载：切换会话时才加载 messages
+          });
+        }
+      } else {
+        // ── 回退：从旧格式的 session JSON 文件迁移生成索引 ──
+        const sessionsDir = getSessionsDir();
+        let files: string[] = [];
+        try {
+          const { readdir } = await import("fs/promises");
+          files = (await readdir(sessionsDir))
+            .filter((f) => f.endsWith(".json"))
+            .sort();
+        } catch {
+          // 目录不存在，无旧数据
+        }
+
+        const { join } = await import("path");
+        for (const file of files) {
+          const data = await readJSON<SessionData | null>(
+            join(sessionsDir, file),
+            null
+          );
+          if (data?.info && data.messages) {
+            const session: SessionData = {
+              info: {
+                id: data.info.id,
+                title: data.info.title,
+                createdAt: data.info.createdAt,
+                messageCount: data.messages.length,
+                lastPreview: lastMessagePreview(data.messages),
+              },
+              messages: [], // 旧数据迁移时也不预加载 messages
+            };
+            if (!this.sessions.find((s) => s.info.id === session.info.id)) {
+              this.sessions.push(session);
+            }
           }
         }
       }
+
+      // 合并不活跃的空会话
       if (this.sessions.length > 0) {
         this.consolidateEmptySessions();
         this.renumberSessionTitles();
         if (!this.activeSessionId) {
           this.activeSessionId = this.sessions[0]?.info.id ?? null;
         }
-        void this.saveSessionsToDisk();
+        // 自动 housekeeping：归档旧会话 + 限制数量
+        await this.housekeepSessions();
+        void this.saveSessionIndexToDisk();
       }
     } catch (err) {
       logError("加载会话历史失败:", String(err));
     }
   }
 
+  /** 会话健康检查：归档过期会话 + 限制活跃数量 */
+  private async housekeepSessions(): Promise<void> {
+    const now = Date.now();
+    const archiveCutoff = now - ARCHIVE_AGE_DAYS * 86400000;
+    let changed = false;
+
+    // 1. 归档超过 ARCHIVE_AGE_DAYS 天的旧会话
+    const toArchiveAge = this.sessions.filter(
+      (s) => s.info.createdAt < archiveCutoff
+    );
+    for (const s of toArchiveAge) {
+      await this.archiveSession(s.info.id);
+      changed = true;
+    }
+
+    // 2. 保留最多 MAX_ACTIVE_SESSIONS 个，其余归档（按创建时间倒序保留最新的）
+    const activeSessions = this.sessions.filter(
+      (s) => !this.isArchived(s.info.id)
+    );
+    if (activeSessions.length > MAX_ACTIVE_SESSIONS) {
+      const sorted = [...activeSessions].sort(
+        (a, b) => b.info.createdAt - a.info.createdAt
+      );
+      const toArchive = sorted.slice(MAX_ACTIVE_SESSIONS);
+      for (const s of toArchive) {
+        await this.archiveSession(s.info.id);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await this.saveSessionIndexToDisk();
+    }
+  }
+
+  private isArchived(sessionId: string): boolean {
+    return !this.sessions.some((s) => s.info.id === sessionId);
+  }
+
+  private async archiveSession(sessionId: string): Promise<void> {
+    // 写索引标记为归档
+    const index = await loadSessionIndex();
+    const entry = index.find((e) => e.id === sessionId);
+    if (entry) {
+      entry.archived = true;
+      await saveSessionIndex(index);
+    }
+    // 移动 JSON 文件到 archive 目录
+    await archiveSessionFile(sessionId);
+    // 从内存中移除
+    this.sessions = this.sessions.filter((s) => s.info.id !== sessionId);
+    if (this.activeSessionId === sessionId) {
+      this.activeSessionId = this.sessions[0]?.info.id ?? null;
+    }
+  }
+
+  /** 切换会话时按需从磁盘加载 messages */
+  private async loadMessagesForSession(sessionId: string): Promise<ChatMessage[] | null> {
+    const data = await loadSessionMessages(sessionId);
+    if (!data?.messages) return null;
+    // 磁盘中存的 role 是 string，需转为联合类型
+    return data.messages.map((m) => ({
+      role: m.role as "user" | "assistant",
+      text: m.text,
+      toolCalls: (m.toolCalls ?? []) as ToolCallDisplay[],
+      isStreaming: false, // 从磁盘加载的始终不是流式状态
+    }));
+  }
+
+  private async saveSessionIndexToDisk(): Promise<void> {
+    try {
+      const index = await loadSessionIndex();
+      const idMap = new Map(index.map((e) => [e.id, e]));
+      for (const s of this.sessions) {
+        idMap.set(s.info.id, {
+          id: s.info.id,
+          title: s.info.title,
+          createdAt: s.info.createdAt,
+          messageCount: s.info.messageCount,
+          lastPreview: s.info.lastPreview,
+          archived: false,
+        });
+      }
+      await saveSessionIndex(Array.from(idMap.values()));
+    } catch (err) {
+      logError("保存会话索引失败:", String(err));
+    }
+  }
+
   private async saveSessionsToDisk(): Promise<void> {
     try {
       await ensureDirs();
-      // 清理旧 session 文件，只保留当前存在的
       const sessionsDir = getSessionsDir();
       const sessionIds = new Set(this.sessions.map((s) => s.info.id));
-      const files = await fs.readdir(sessionsDir).catch(() => []);
+
+      // 清理旧文件
+      let files: string[] = [];
+      try {
+        const { readdir } = await import("fs/promises");
+        files = (await readdir(sessionsDir))
+          .filter((f) => f.endsWith(".json"));
+      } catch {
+        // 目录可能不存在
+      }
       for (const file of files) {
-        if (file.endsWith(".json") && !sessionIds.has(file.replace(/\.json$/, ""))) {
-          await fs.unlink(path.join(sessionsDir, file)).catch(() => {});
+        if (!sessionIds.has(file.replace(/\.json$/, ""))) {
+          const { unlink } = await import("fs/promises");
+          const { join } = await import("path");
+          await unlink(join(sessionsDir, file)).catch(() => {});
         }
       }
-      // 写入每个会话
+
+      // 写入有 messages 的会话
       for (const session of this.sessions) {
-        const filePath = getSessionPath(session.info.id);
-        await fs.writeFile(filePath, JSON.stringify(session, null, 2), "utf-8");
+        if (session.messages.length > 0) {
+          const filePath = getSessionPath(session.info.id);
+          const { writeFile } = await import("fs/promises");
+          await writeFile(filePath, JSON.stringify(session, null, 2), "utf-8");
+        }
       }
+
+      // 同步更新索引
+      await this.saveSessionIndexToDisk();
     } catch (err) {
       logError("保存会话失败:", String(err));
     }
@@ -591,6 +806,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } finally {
       assistantMsg.isStreaming = false;
       this.abortController = null;
+      // 更新元数据
+      session.info.messageCount = session.messages.length;
+      session.info.lastPreview = lastMessagePreview(session.messages);
       this.postState();
       this.saveSessionsToDisk();
     }
@@ -840,17 +1058,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
   .history-dropdown.show { display: block; }
   .history-item {
-    display: flex; align-items: center; justify-content: space-between;
+    display: flex; align-items: flex-start; justify-content: space-between;
     gap: 8px; padding: 6px 8px; border-radius: 6px;
     font-size: 12px; cursor: pointer;
   }
   .history-item:hover { background: var(--surface-hover); }
   .history-item.active { background: var(--accent-soft); color: var(--accent); }
+  .history-item-main {
+    flex: 1; min-width: 0;
+    display: flex; flex-direction: column;
+    gap: 1px;
+  }
   .history-item .t {
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-weight: 500;
+  }
+  .history-item .preview {
+    font-size: 10px;
+    color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    opacity: 0.75;
   }
   .history-item .time {
     flex: 0 0 auto; font-size: 10px; color: var(--muted);
+    padding-top: 1px;
+    white-space: nowrap;
   }
   .hist-divider { height: 1px; background: var(--border-subtle); margin: 4px 2px; }
   .new-session-btn {
@@ -1330,12 +1562,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <svg class="chev" width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
     <div class="history-dropdown" id="historyDropdown">
+      <div style="padding: 0 4px 4px;">
+        <input
+          type="text"
+          id="sessionSearch"
+          placeholder="搜索会话…"
+          style="
+            width: 100%;
+            background: var(--input-bg, #2b2b2b);
+            border: 1px solid var(--border-subtle);
+            border-radius: 6px;
+            color: var(--fg);
+            font-size: 12px;
+            padding: 5px 8px;
+            outline: none;
+          "
+          onfocus="this.style.borderColor='var(--accent)'"
+          onblur="this.style.borderColor='var(--border-subtle)'"
+        />
+      </div>
       <div class="new-session-btn" id="newSessionBtn">
         <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
         新建会话
       </div>
       <div class="hist-divider"></div>
-      <div id="sessionList"></div>
+      <div id="sessionList" style="max-height:340px;overflow-y:auto;"></div>
     </div>
   </div>
 

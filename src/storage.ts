@@ -26,8 +26,16 @@ export function getSessionsDir(): string {
   return path.join(getHxxCodeDir(), "sessions");
 }
 
+export function getArchiveDir(): string {
+  return path.join(getSessionsDir(), "archive");
+}
+
 export function getConfigPath(): string {
   return path.join(getHxxCodeDir(), "config.json");
+}
+
+export function getSessionIndexPath(): string {
+  return path.join(getHxxCodeDir(), "sessions-index.json");
 }
 
 export function getOpencodeDir(): string {
@@ -47,6 +55,10 @@ export function getSessionPath(sessionId: string): string {
   return path.join(getSessionsDir(), `${sessionId}.json`);
 }
 
+export function getArchiveSessionPath(sessionId: string): string {
+  return path.join(getArchiveDir(), `${sessionId}.json`);
+}
+
 /** 确保扩展自有数据目录存在 */
 export async function ensureDirs(): Promise<void> {
   await fs.mkdir(getHxxCodeDir(), { recursive: true });
@@ -56,6 +68,70 @@ export async function ensureDirs(): Promise<void> {
 /** 确保 OpenCode 标准配置目录存在 */
 export async function ensureOpencodeDirs(): Promise<void> {
   await fs.mkdir(getOpencodeDir(), { recursive: true });
+}
+
+// ── Session 索引（轻量元数据，一个文件替代 N 个文件遍历） ────────────────
+
+export interface SessionIndexEntry {
+  id: string;
+  title: string;
+  createdAt: number;
+  messageCount: number;
+  lastPreview: string;
+  archived: boolean;
+}
+
+/** 读 sessions-index.json，返回全部索引条目 */
+export async function loadSessionIndex(): Promise<SessionIndexEntry[]> {
+  try {
+    const raw = await fs.readFile(getSessionIndexPath(), "utf-8");
+    return JSON.parse(raw) as SessionIndexEntry[];
+  } catch {
+    return [];
+  }
+}
+
+/** 全量覆写 sessions-index.json */
+export async function saveSessionIndex(entries: SessionIndexEntry[]): Promise<void> {
+  await ensureDirs();
+  await fs.writeFile(
+    getSessionIndexPath(),
+    JSON.stringify(entries, null, 2),
+    "utf-8"
+  );
+}
+
+/** 将 session JSON 文件移到归档目录 */
+export async function archiveSessionFile(sessionId: string): Promise<void> {
+  const src = getSessionPath(sessionId);
+  const dst = getArchiveSessionPath(sessionId);
+  await fs.mkdir(getArchiveDir(), { recursive: true });
+  try {
+    await fs.rename(src, dst);
+  } catch {
+    // 如果 rename 失败（跨文件系统），回退到复制 + 删除
+    try {
+      await fs.copyFile(src, dst);
+      await fs.unlink(src);
+    } catch {
+      // 静默失败
+    }
+  }
+}
+
+/** 读单个 session messages（按需加载，不常驻内存） */
+export async function loadSessionMessages(
+  sessionId: string
+): Promise<{ messages: Array<{ role: string; text: string; toolCalls: unknown[]; isStreaming: boolean }> } | null> {
+  const tryPath = async (p: string) => {
+    try {
+      const raw = await fs.readFile(p, "utf-8");
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  };
+  return (await tryPath(getSessionPath(sessionId))) ?? (await tryPath(getArchiveSessionPath(sessionId)));
 }
 
 // ── JSON 文件读写 ─────────────────────────────────────────────────────────

@@ -30,7 +30,7 @@
       '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>';
 
     let state = {
-      sessions: [],
+      sessionList: [],
       activeSessionId: null,
       messages: [],
       providers: [],
@@ -38,6 +38,8 @@
       activeModel: null,
       isStreaming: false,
     };
+
+    const MAX_VISIBLE_SESSIONS = 20;
 
     let pendingPermissionId = null;
 
@@ -67,23 +69,93 @@
     function renderSessions() {
       if (!sessionName || !sessionList) return;
       // 更新标题
-      const activeSession = state.sessions.find((s) => s.id === state.activeSessionId);
+      const activeSession = state.sessionList.find(
+        (s) => s.id === state.activeSessionId
+      );
       sessionName.textContent = activeSession ? activeSession.title : "选择会话";
 
-      // 更新下拉列表
+      // 获取搜索关键词
+      const searchInput = document.getElementById("sessionSearch");
+      const searchTerm = (searchInput?.value ?? "").trim().toLowerCase();
+
+      // 过滤
+      let filtered = state.sessionList;
+      if (searchTerm) {
+        filtered = filtered.filter((s) =>
+          s.title.toLowerCase().includes(searchTerm)
+        );
+      }
+
+      // 渲染（限制显示数量）
       sessionList.innerHTML = "";
-      for (const s of state.sessions) {
+      const visible = filtered.slice(0, MAX_VISIBLE_SESSIONS);
+      const remaining = filtered.length - visible.length;
+
+      for (const s of visible) {
         const item = document.createElement("div");
-        item.className = "history-item" + (s.id === state.activeSessionId ? " active" : "");
+        item.className =
+          "history-item" + (s.id === state.activeSessionId ? " active" : "");
         item.dataset.sid = s.id;
-        item.innerHTML =
-          '<span class="t">' + escapeHtml(s.title) + '</span>' +
-          '<span class="time">' + timeAgo(s.createdAt) + '</span>';
+
+        const mainDiv = document.createElement("div");
+        mainDiv.className = "history-item-main";
+
+        const titleSpan = document.createElement("span");
+        titleSpan.className = "t";
+        titleSpan.textContent = s.title;
+        mainDiv.appendChild(titleSpan);
+
+        if (s.lastPreview) {
+          const previewSpan = document.createElement("span");
+          previewSpan.className = "preview";
+          previewSpan.textContent = s.lastPreview.slice(0, 50);
+          mainDiv.appendChild(previewSpan);
+        }
+
+        item.appendChild(mainDiv);
+
+        const timeSpan = document.createElement("span");
+        timeSpan.className = "time";
+        let timeText = timeAgo(s.createdAt);
+        if (s.messageCount > 0) {
+          timeText += " · " + s.messageCount + " 条";
+        }
+        timeSpan.textContent = timeText;
+        item.appendChild(timeSpan);
+
         item.addEventListener("click", () => {
-          vscode.postMessage({ type: "switchSession", payload: { sessionId: s.id } });
+          vscode.postMessage({
+            type: "switchSession",
+            payload: { sessionId: s.id },
+          });
           closeDropdown();
         });
         sessionList.appendChild(item);
+      }
+
+      // 超出上限提示
+      if (remaining > 0) {
+        const moreItem = document.createElement("div");
+        moreItem.className = "history-item muted";
+        moreItem.style.cssText =
+          "color: var(--muted); cursor: default; font-size: 11px;";
+        if (searchTerm) {
+          moreItem.textContent =
+            "...还有 " + remaining + " 个匹配会话（请输入更精确的关键词）";
+        } else {
+          moreItem.textContent =
+            "...还有 " +
+            remaining +
+            " 个会话（使用搜索或归档不活跃会话）";
+        }
+        sessionList.appendChild(moreItem);
+      } else if (searchTerm && visible.length === 0) {
+        const noResult = document.createElement("div");
+        noResult.className = "history-item muted";
+        noResult.style.cssText =
+          "color: var(--muted); cursor: default; font-size: 11px;";
+        noResult.textContent = "未找到匹配的会话";
+        sessionList.appendChild(noResult);
       }
     }
 
@@ -617,13 +689,28 @@
     // ── Dropdown / Popover toggles ──
 
     function toggleDropdown() {
-      historyDropdown?.classList.toggle("show");
-      sessionPicker?.classList.toggle("open");
+      const wasOpen = historyDropdown?.classList.contains("show");
+      if (wasOpen) {
+        closeDropdown();
+        return;
+      }
+      historyDropdown?.classList.add("show");
+      sessionPicker?.classList.add("open");
+      // 清空搜索框并聚焦
+      const searchInput = document.getElementById("sessionSearch");
+      if (searchInput) {
+        searchInput.value = "";
+        queueMicrotask(() => searchInput.focus());
+      }
     }
 
     function closeDropdown() {
       historyDropdown?.classList.remove("show");
       sessionPicker?.classList.remove("open");
+      const searchInput = document.getElementById("sessionSearch");
+      if (searchInput) {
+        searchInput.value = "";
+      }
     }
 
     function togglePopover() {
@@ -780,6 +867,18 @@
         closePopover();
       }
     });
+
+    // Session search input
+    const sessionSearch = document.getElementById("sessionSearch");
+    if (sessionSearch) {
+      sessionSearch.addEventListener("input", () => renderSessions());
+      sessionSearch.addEventListener("click", (e) => e.stopPropagation());
+      sessionSearch.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          closeDropdown();
+        }
+      });
+    }
 
     // Input
     inputBox?.addEventListener("input", autoResizeInput);
