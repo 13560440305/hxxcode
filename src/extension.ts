@@ -140,6 +140,17 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
   context.subscriptions.push(
+    vscode.commands.registerCommand("opencodeBridge.newSession", async () => {
+      await initializeCore(context);
+      await vscode.commands.executeCommand("workbench.view.extension.opencodeBridge");
+      await vscode.commands.executeCommand("opencodeBridge.chatView.focus");
+
+      const provider = ChatViewProvider.getInstance() ?? chatViewProvider;
+      await provider.newSession();
+    })
+  );
+
+  context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     })

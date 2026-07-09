@@ -41,6 +41,11 @@
         "icon": "$(settings-gear)"
       },
       {
+        "command": "opencodeBridge.newSession",
+        "title": "HxxCode: 新建会话",
+        "icon": "$(add)"
+      },
+      {
         "command": "opencodeBridge.startServer",
         "title": "HxxCode: 启动 / 重启 Server"
       },
@@ -50,7 +55,19 @@
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "opencodeBridge.newSession",
+          "group": "navigation@100",
+          "when": "editorTextFocus || resourceScheme == file || resourceScheme == vscode-remote"
+        }
+      ],
       "view/title": [
+        {
+          "command": "opencodeBridge.newSession",
+          "when": "view == opencodeBridge.chatView",
+          "group": "navigation@1"
+        },
         {
           "command": "opencodeBridge.openSettings",
           "when": "view == opencodeBridge.chatView",

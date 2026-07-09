@@ -134,6 +134,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ChatViewProvider._instance?.bindOpencodeManager(manager);
   }
 
+  /** 供命令面板 / 编辑器标题栏「新建会话」调用 */
+  static getInstance(): ChatViewProvider | null {
+    return ChatViewProvider._instance;
+  }
+
   private bindOpencodeManager(manager: OpencodeManager): void {
     manager.setPermissionHandler((req) => this.requestPermissionInWebview(req));
   }
@@ -285,9 +290,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
 
       case "createSession":
-        this.createLocalSession();
-        this.postState();
-        void this.saveSessionsToDisk();
+        await this.newSession();
         break;
 
       case "switchSession":
@@ -420,6 +423,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.sessions.push(session);
     this.activeSessionId = id;
     return id;
+  }
+
+  /** 新建会话并聚焦侧栏 */
+  async newSession(): Promise<void> {
+    if (!(await this.ensureInitialized())) {
+      return;
+    }
+    if (!this.sessionsLoaded) {
+      await this.loadSessionsFromDisk();
+    }
+    this.createLocalSession();
+    this.postState();
+    await this.saveSessionsToDisk();
+    await this._view?.show?.(true);
   }
 
   private deleteSession(sessionId: string): void {
