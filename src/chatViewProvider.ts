@@ -1,4 +1,6 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
 import { OpencodeManager, StreamEvent } from "./opencodeManager";
 import type { PermissionReply, PermissionRequest } from "@opencode-ai/sdk";
 import { ProviderStore, ProviderConfig } from "./providerStore";
@@ -931,6 +933,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "media", "chat-webview.js")
     );
+    // 读取 logo.png 转为 base64 data URI，避免 CSP / webview 资源加载问题
+    let logoSrc = "";
+    try {
+      const logoPath = path.join(this.extensionUri.fsPath, "media", "logo.png");
+      const logoBuf = fs.readFileSync(logoPath);
+      logoSrc = "data:image/png;base64," + logoBuf.toString("base64");
+    } catch {
+      logoSrc = "data:image/svg+xml," + encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M3 4h3v6.5h5V4h3v16h-3v-6.5H6V20H3V4z"/><path d="M16 4l5 8-5 8h-2.5l5-8-5-8H16z"/></svg>'
+      );
+    }
     const cspSource = webview.cspSource;
     const bootJson = JSON.stringify(initialState).replace(/</g, "\\u003c");
 
@@ -939,7 +952,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src ${cspSource};" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src ${cspSource}; img-src ${cspSource} data:;" />
 <style>
   :root {
     --bg: var(--vscode-sideBar-background, #1e1e1e);
@@ -996,12 +1009,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     letter-spacing: 0.4px;
     color: var(--fg);
   }
-  .brand .dot {
-    width: 6px; height: 6px;
-    border-radius: 50%;
-    background: var(--ok);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent);
+  .brand .logo-img {
+    width: 18px; height: 18px;
     flex-shrink: 0;
+    object-fit: contain;
+    border-radius: 3px;
   }
   .icon-btn {
     width: 26px; height: 26px;
@@ -1547,7 +1559,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   <!-- Header -->
   <div class="header">
-    <div class="brand"><span class="dot"></span>HXXCODE</div>
+    <div class="brand"><img class="logo-img" src="${logoSrc}" alt="HxxCode" />HXXCODE</div>
     <div class="header-actions">
       <button class="icon-btn" id="settingsBtn" title="供应商设置">
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M8 1v2M8 13v2M2.5 4.5l1.5 1.5M12 10l1.5 1.5M1 8h2M13 8h2M2.5 11.5L4 10M12 6l1.5-1.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>

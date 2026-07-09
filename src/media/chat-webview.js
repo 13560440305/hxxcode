@@ -679,10 +679,11 @@
 
     function updateStatusBar() {
       if (statusLeft) {
-        statusLeft.textContent = "";
+        const activeProvider = state.providers.find(p => p.id === state.activeProviderId);
+        statusLeft.textContent = activeProvider ? activeProvider.name : "未连接";
       }
       if (statusRight) {
-        statusRight.textContent = state.activeModel || "";
+        statusRight.textContent = state.activeModel || "未选择模型";
       }
     }
 
