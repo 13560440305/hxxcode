@@ -15,9 +15,24 @@ export interface SessionCreateResponse {
   data: { id: string; title?: string };
 }
 
+export interface PromptTextPart {
+  type: "text";
+  text: string;
+}
+
+export interface PromptFilePart {
+  type: "file";
+  mime: string;
+  filename?: string;
+  /** data: 或 file:// URI；OpenCode 2.0 会映射为 prompt.files[].uri */
+  url: string;
+}
+
+export type PromptPart = PromptTextPart | PromptFilePart | { type: string; text?: string; mime?: string; filename?: string; url?: string };
+
 export interface SessionPromptBody {
   model?: string;
-  parts?: Array<{ type: string; text: string }>;
+  parts?: PromptPart[];
   text?: string;
 }
 

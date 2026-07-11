@@ -32,6 +32,73 @@ export interface StreamEvent {
   error?: string;
 }
 
+export interface PromptImageAttachment {
+  mime: string;
+  name: string;
+  /** data:image/...;base64,... 或可读的绝对路径（会转成 data URL） */
+  dataUrl?: string;
+  path?: string;
+}
+
+export interface PromptTextAttachment {
+  name: string;
+  content: string;
+}
+
+export interface PromptAttachments {
+  images?: PromptImageAttachment[];
+  texts?: PromptTextAttachment[];
+}
+
+/** 把未知错误值转成可读字符串（避免 [object Object]） */
+export function formatErrorMessage(err: unknown): string {
+  if (err == null) return "未知错误";
+  if (typeof err === "string") return friendlyProviderError(err);
+  if (err instanceof Error) return friendlyProviderError(err.message || String(err));
+  if (typeof err === "object") {
+    const obj = err as Record<string, unknown>;
+    if (typeof obj.message === "string" && obj.message) {
+      return friendlyProviderError(obj.message);
+    }
+    if (obj.error != null) return formatErrorMessage(obj.error);
+    try {
+      return friendlyProviderError(JSON.stringify(err));
+    } catch {
+      return "未知错误";
+    }
+  }
+  return friendlyProviderError(String(err));
+}
+
+function friendlyProviderError(message: string): string {
+  if (/image_url|unknown variant `image`|expected `text`|does not support image|type=\"image\"|Not Supported/i.test(message)) {
+    return (
+      "当前供应商 API 不接受图片内容（仅支持 text）。" +
+      "DeepSeek 官方 API（api.deepseek.com）目前为纯文本接口，即使 deepseek-v4-pro 也不能直接传 image_url；" +
+      "Claude Code 等工具若能「看图」，通常是先用其它 Vision 模型转成文字再发给 DeepSeek。" +
+      "请改用支持多模态的供应商/模型（如 OpenAI GPT-4o、带 Vision 的中转），或改用文字描述截图。\n\n" +
+      `详情: ${message}`
+    );
+  }
+  return message;
+}
+
+/** 把用户输入与文本附件拼成最终 prompt 文本 */
+export function buildPromptText(
+  userText: string,
+  texts?: PromptTextAttachment[]
+): string {
+  const chunks: string[] = [];
+  const trimmed = userText.trim();
+  if (trimmed) chunks.push(trimmed);
+  if (texts?.length) {
+    for (const t of texts) {
+      chunks.push(`---\n附件: ${t.name}\n\`\`\`\n${t.content}\n\`\`\`\n---`);
+    }
+  }
+  return chunks.join("\n\n") || "(附件)";
+}
+
 /**
  * 负责：
  * 1. 找一个空闲端口，spawn `opencode serve`
@@ -204,17 +271,18 @@ export class OpencodeManager implements vscode.Disposable {
   }
 
   /** 发送一条 prompt，返回可迭代的流式响应（由调用方转发给 Webview 渲染） */
-  async prompt(sessionId: string, text: string) {
+  async prompt(sessionId: string, text: string, attachments?: PromptAttachments) {
     const client = await this.ensureClient();
     const { provider, model } = this.providerStore.getActive();
     if (!provider || !model) {
       throw new Error("尚未配置可用的模型供应商，请先在设置面板中添加供应商和模型");
     }
+    const parts = await this.buildPromptParts(text, attachments);
     return client.session.prompt({
       path: { id: sessionId },
       body: {
         model: `${provider.id}/${model}`,
-        parts: [{ type: "text", text }],
+        parts,
       },
     });
   }
@@ -229,7 +297,8 @@ export class OpencodeManager implements vscode.Disposable {
     sessionId: string,
     text: string,
     onEvent: (event: StreamEvent) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    attachments?: PromptAttachments
   ): Promise<void> {
     const t0 = Date.now();
     const client = await this.ensureClient();
@@ -238,17 +307,22 @@ export class OpencodeManager implements vscode.Disposable {
       throw new Error("尚未配置可用的模型供应商，请先在设置面板中添加");
     }
 
+    const parts = await this.buildPromptParts(text, attachments);
+    const textLen = parts.find((p) => p.type === "text")?.text?.length ?? 0;
+    const fileCount = parts.filter((p) => p.type === "file").length;
+
     this.flow("promptStream 开始", {
       sessionId,
       model: `${provider.id}/${model}`,
-      textLen: text.length,
+      textLen,
+      fileCount,
     });
 
     const result = await client.session.prompt({
       path: { id: sessionId },
       body: {
         model: `${provider.id}/${model}`,
-        parts: [{ type: "text", text }],
+        parts,
       },
     });
 
@@ -278,12 +352,57 @@ export class OpencodeManager implements vscode.Disposable {
         this.flow("promptStream 结束 (benign)", { chunks: chunkCount, ms: Date.now() - t0 });
         return;
       }
-      this.flow("promptStream 错误", { err: String(err), chunks: chunkCount, ms: Date.now() - t0 });
-      onEvent({ type: "error", error: String(err) });
+      this.flow("promptStream 错误", {
+        err: formatErrorMessage(err),
+        chunks: chunkCount,
+        ms: Date.now() - t0,
+      });
+      onEvent({ type: "error", error: formatErrorMessage(err) });
       return;
     }
     if (!signal?.aborted && !finished) onEvent({ type: "finish" });
     this.flow("promptStream 完成", { chunks: chunkCount, finished, ms: Date.now() - t0 });
+  }
+
+  private async buildPromptParts(
+    text: string,
+    attachments?: PromptAttachments
+  ): Promise<Array<{ type: string; text?: string; mime?: string; filename?: string; url?: string }>> {
+    const promptText = buildPromptText(text, attachments?.texts);
+    const parts: Array<{
+      type: string;
+      text?: string;
+      mime?: string;
+      filename?: string;
+      url?: string;
+    }> = [{ type: "text", text: promptText }];
+
+    for (const img of attachments?.images ?? []) {
+      const url = await this.resolveImageDataUrl(img);
+      if (!url) continue;
+      parts.push({
+        type: "file",
+        mime: img.mime || "image/png",
+        filename: img.name || "image.png",
+        url,
+      });
+    }
+    return parts;
+  }
+
+  private async resolveImageDataUrl(img: PromptImageAttachment): Promise<string | null> {
+    if (img.dataUrl?.startsWith("data:")) return img.dataUrl;
+    if (img.path) {
+      try {
+        const buf = await fs.readFile(img.path);
+        const mime = img.mime || "image/png";
+        return `data:${mime};base64,${buf.toString("base64")}`;
+      } catch (err) {
+        logError("读取图片附件失败:", String(err));
+        return null;
+      }
+    }
+    return null;
   }
 
   /** 由 ChatViewProvider 注册：在侧栏 Webview 内展示权限确认 */
@@ -361,7 +480,7 @@ export class OpencodeManager implements vscode.Disposable {
       const data = chunk.data as Record<string, unknown> | undefined;
       onEvent({
         type: "error",
-        error: (data?.error ?? data?.message ?? "Agent 执行失败") as string,
+        error: formatErrorMessage(data?.error ?? data?.message ?? "Agent 执行失败"),
       });
       onEvent({ type: "finish" });
       return;
@@ -394,10 +513,6 @@ export class OpencodeManager implements vscode.Disposable {
       }
       return;
     }
-    if (type === "session.next.step.failed") {
-      onEvent({ type: "finish" });
-      return;
-    }
 
     if (type === "text" || type === "text_delta") {
       const delta = (chunk.delta ?? chunk.text ?? chunk.content) as string | undefined;
@@ -426,7 +541,10 @@ export class OpencodeManager implements vscode.Disposable {
     }
 
     if (type === "error") {
-      onEvent({ type: "error", error: (chunk.message ?? chunk.error) as string });
+      onEvent({
+        type: "error",
+        error: formatErrorMessage(chunk.message ?? chunk.error ?? chunk),
+      });
       return;
     }
 

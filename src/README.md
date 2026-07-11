@@ -39,7 +39,7 @@ HxxCode 是一款 VS Code 扩展，在活动栏侧边栏中提供 AI 编码 Agen
 
 或命令行安装：
 ```bash
-code --install-extension opencode-bridge-0.1.0.vsix
+code --install-extension opencode-bridge-0.1.1.vsix
 ```
 
 #### 开发模式运行

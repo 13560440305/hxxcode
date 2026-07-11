@@ -939,15 +939,41 @@ function createHttpClient(baseURL, auth, directory, log = () => {}, onPermission
                 }
               }
 
+              const parts = Array.isArray(options.body?.parts)
+                ? options.body.parts
+                : [];
               const text =
-                options.body?.parts?.find((p) => p.type === "text")?.text ??
-                options.body?.text ??
+                parts
+                  .filter((p) => p.type === "text" && typeof p.text === "string")
+                  .map((p) => p.text)
+                  .join("\n\n") ||
+                options.body?.text ||
                 "";
-              log(`发送 prompt (${text.length} chars): ${preview(text, 80)}`);
+              // OpenCode 2.0 PromptInput: { text, files?: [{ uri, name?, description? }] }
+              // （不是标准 SDK 的 parts[{type:file,url,mime}]）
+              const files = parts
+                .filter(
+                  (p) =>
+                    p.type === "file" &&
+                    typeof (p.url || p.uri) === "string"
+                )
+                .map((p) => {
+                  const uri = p.url || p.uri;
+                  const file = { uri };
+                  if (p.filename || p.name) file.name = p.filename || p.name;
+                  if (p.mime) file.description = p.mime;
+                  return file;
+                });
+              log(
+                `发送 prompt (${text.length} chars, files=${files.length}): ${preview(text, 80)}`
+              );
+
+              const promptPayload =
+                files.length > 0 ? { text, files } : { text };
 
               const promptRes = await api(`/session/${id}/prompt`, {
                 method: "POST",
-                body: JSON.stringify({ prompt: { text } }),
+                body: JSON.stringify({ prompt: promptPayload }),
               });
               if (!promptRes.ok) {
                 throw new Error(

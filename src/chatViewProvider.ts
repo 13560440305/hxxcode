@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
-import { OpencodeManager, StreamEvent } from "./opencodeManager";
+import { OpencodeManager, StreamEvent, formatErrorMessage, type PromptAttachments } from "./opencodeManager";
 import type { PermissionReply, PermissionRequest } from "@opencode-ai/sdk";
 import { ProviderStore, ProviderConfig } from "./providerStore";
 import { logError, log } from "./log";
@@ -10,6 +10,8 @@ import {
   getSessionPath,
   getArchiveSessionPath,
   getSessionsDir,
+  getHxxCodeDir,
+  ensureSessionAttachmentsDir,
   loadSessionIndex,
   saveSessionIndex,
   archiveSessionFile,
@@ -17,8 +19,25 @@ import {
   readJSON,
   SessionIndexEntry,
 } from "./storage";
+import * as crypto from "crypto";
+import * as fsp from "fs/promises";
 
 // ── Data types ───────────────────────────────────────────────────────────────
+
+type AttachmentKind = "image" | "text";
+
+interface Attachment {
+  id: string;
+  kind: AttachmentKind;
+  mime: string;
+  name: string;
+  path?: string;
+  /** 仅传输/预览用，不落盘到会话 JSON */
+  dataUrl?: string;
+  textContent?: string;
+  /** 发给 webview 的预览 URI */
+  previewUrl?: string;
+}
 
 /** 会话元数据（轻量，传给前端渲染列表用） */
 interface SessionMeta {
@@ -49,6 +68,7 @@ interface ToolCallDisplay {
 interface ChatMessage {
   role: "user" | "assistant";
   text: string;
+  attachments?: Attachment[];
   toolCalls: ToolCallDisplay[];
   isStreaming: boolean;
 }
@@ -67,15 +87,39 @@ const ARCHIVE_AGE_DAYS = 30;
 
 function lastMessagePreview(messages: ChatMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
-    const t = messages[i].text?.trim();
+    const m = messages[i];
+    const t = m.text?.trim();
     if (t) return t.slice(0, 80);
+    if (m.attachments?.length) {
+      return `[附件] ${m.attachments.map((a) => a.name).join(", ")}`.slice(0, 80);
+    }
   }
   return "";
 }
 
+function persistableAttachments(attachments?: Attachment[]): Attachment[] | undefined {
+  if (!attachments?.length) return undefined;
+  return attachments.map(({ id, kind, mime, name, path }) => ({
+    id,
+    kind,
+    mime,
+    name,
+    path,
+  }));
+}
+
+type IncomingAttachment = {
+  id?: string;
+  kind: AttachmentKind;
+  mime: string;
+  name: string;
+  dataUrl?: string;
+  textContent?: string;
+};
+
 type WebviewMessage =
   | { type: "ready" }
-  | { type: "sendMessage"; payload: { text: string } }
+  | { type: "sendMessage"; payload: { text: string; attachments?: IncomingAttachment[] } }
   | { type: "createSession" }
   | { type: "switchSession"; payload: { sessionId: string } }
   | { type: "switchModel"; payload: { providerId: string; model: string } }
@@ -215,7 +259,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.options = {
       enableScripts: true,
-      localResourceRoots: [this.extensionUri],
+      localResourceRoots: [
+        this.extensionUri,
+        vscode.Uri.file(getHxxCodeDir()),
+        vscode.Uri.file(getSessionsDir()),
+      ],
     };
 
     webviewView.webview.onDidReceiveMessage((msg: WebviewMessage) => {
@@ -312,12 +360,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return {
       sessionList: this.buildSessionListItems(),
       activeSessionId: this.activeSessionId,
-      messages: session?.messages ?? [],
+      messages: this.enrichMessagesForWebview(session?.messages ?? []),
       providers: providerStore.list(),
       activeProviderId: provider?.id ?? null,
       activeModel: model,
       isStreaming: !!this.abortController,
     };
+  }
+
+  /** 给 webview 补上图片 previewUrl，去掉大体积正文 */
+  private enrichMessagesForWebview(messages: ChatMessage[]): ChatMessage[] {
+    const webview = this._view?.webview;
+    return messages.map((m) => ({
+      ...m,
+      attachments: m.attachments?.map((a) => {
+        const out: Attachment = {
+          id: a.id,
+          kind: a.kind,
+          mime: a.mime,
+          name: a.name,
+          path: a.path,
+        };
+        if (a.kind === "image") {
+          if (a.path && webview) {
+            try {
+              out.previewUrl = webview.asWebviewUri(vscode.Uri.file(a.path)).toString();
+            } catch {
+              // ignore
+            }
+          } else if (a.dataUrl) {
+            out.previewUrl = a.dataUrl;
+          }
+        }
+        return out;
+      }),
+    }));
   }
 
   private postState(): void {
@@ -334,7 +411,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
 
       case "sendMessage":
-        await this.handleSendMessage(msg.payload.text);
+        await this.handleSendMessage(msg.payload.text, msg.payload.attachments);
         break;
 
       case "createSession":
@@ -660,12 +737,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const data = await loadSessionMessages(sessionId);
     if (!data?.messages) return null;
     // 磁盘中存的 role 是 string，需转为联合类型
-    return data.messages.map((m) => ({
-      role: m.role as "user" | "assistant",
-      text: m.text,
-      toolCalls: (m.toolCalls ?? []) as ToolCallDisplay[],
-      isStreaming: false, // 从磁盘加载的始终不是流式状态
-    }));
+    return data.messages.map((m) => {
+      const raw = m as {
+        role: string;
+        text: string;
+        toolCalls?: unknown[];
+        attachments?: Attachment[];
+      };
+      return {
+        role: raw.role as "user" | "assistant",
+        text: raw.text,
+        toolCalls: (raw.toolCalls ?? []) as ToolCallDisplay[],
+        attachments: persistableAttachments(raw.attachments),
+        isStreaming: false, // 从磁盘加载的始终不是流式状态
+      };
+    });
   }
 
   private async saveSessionIndexToDisk(): Promise<void> {
@@ -711,12 +797,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      // 写入有 messages 的会话
+      // 写入有 messages 的会话（附件只存元数据，不写 dataUrl/正文）
       for (const session of this.sessions) {
         if (session.messages.length > 0) {
           const filePath = getSessionPath(session.info.id);
           const { writeFile } = await import("fs/promises");
-          await writeFile(filePath, JSON.stringify(session, null, 2), "utf-8");
+          const toSave = {
+            info: session.info,
+            messages: session.messages.map((m) => ({
+              role: m.role,
+              text: m.text,
+              toolCalls: m.toolCalls,
+              isStreaming: false,
+              attachments: persistableAttachments(m.attachments),
+            })),
+          };
+          await writeFile(filePath, JSON.stringify(toSave, null, 2), "utf-8");
         }
       }
 
@@ -729,7 +825,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // ── 发送消息 ──────────────────────────────────────────────────────────────
 
-  private async handleSendMessage(text: string): Promise<void> {
+  private async handleSendMessage(
+    text: string,
+    incomingAttachments?: IncomingAttachment[]
+  ): Promise<void> {
     if (!(await this.ensureInitialized())) {
       this.postError("HxxCode 尚未就绪，请稍后重试");
       return;
@@ -744,28 +843,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    // 追加用户消息
-    session.messages.push({
-      role: "user",
-      text,
-      toolCalls: [],
-      isStreaming: false,
-    });
-
-    // 创建占位的 assistant 消息（流式输出会不断更新它）
-    const assistantMsg: ChatMessage = {
-      role: "assistant",
-      text: "",
-      toolCalls: [],
-      isStreaming: true,
-    };
-    session.messages.push(assistantMsg);
-
-    this.postState();
-
-    // 自动重命名会话（第一轮对话时）
-    if (session.messages.filter((m) => m.role === "user").length === 1) {
-      session.info.title = text.slice(0, 40) + (text.length > 40 ? "…" : "");
+    const trimmed = text.trim();
+    if (!trimmed && !(incomingAttachments?.length)) {
+      return;
     }
 
     this.abortController = new AbortController();
@@ -781,39 +861,182 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (this.activeSessionId === oldId) {
           this.activeSessionId = backendId;
         }
-        this.postState();
-        void this.saveSessionsToDisk();
       }
+
+      const savedAttachments = await this.persistIncomingAttachments(
+        backendId,
+        incomingAttachments
+      );
+
+      // 追加用户消息
+      session.messages.push({
+        role: "user",
+        text: trimmed,
+        attachments: savedAttachments.length ? savedAttachments : undefined,
+        toolCalls: [],
+        isStreaming: false,
+      });
+
+      // 创建占位的 assistant 消息（流式输出会不断更新它）
+      const assistantMsg: ChatMessage = {
+        role: "assistant",
+        text: "",
+        toolCalls: [],
+        isStreaming: true,
+      };
+      session.messages.push(assistantMsg);
+
+      this.postState();
+
+      // 自动重命名会话（第一轮对话时）
+      if (session.messages.filter((m) => m.role === "user").length === 1) {
+        const titleBase =
+          trimmed ||
+          savedAttachments.map((a) => a.name).join(", ") ||
+          "新会话";
+        session.info.title =
+          titleBase.slice(0, 40) + (titleBase.length > 40 ? "…" : "");
+      }
+
+      const promptAttachments = await this.toPromptAttachments(savedAttachments);
 
       await this.requireOpencodeManager().promptStream(
         backendId,
-        text,
+        trimmed,
         (event) => {
           this.handleStreamEvent(session!.info.id, event);
         },
-        this.abortController.signal
+        this.abortController.signal,
+        promptAttachments
       );
     } catch (err) {
-      const msg = (err as Error).message;
+      const msg = formatErrorMessage(err);
+      const last = session.messages[session.messages.length - 1];
+      const assistantMsg =
+        last?.role === "assistant" ? last : null;
       if (
         msg.includes("aborted") ||
         msg.includes("cancel") ||
         msg.includes("terminated")
       ) {
-        assistantMsg.text += "\n\n*已取消*";
+        if (assistantMsg) assistantMsg.text += "\n\n*已取消*";
       } else {
         this.postError(msg);
-        assistantMsg.text += `\n\n**错误**: ${msg}`;
+        if (assistantMsg) {
+          assistantMsg.text += `\n\n**错误**: ${msg}`;
+        } else {
+          session.messages.push({
+            role: "assistant",
+            text: `**错误**: ${msg}`,
+            toolCalls: [],
+            isStreaming: false,
+          });
+        }
       }
     } finally {
-      assistantMsg.isStreaming = false;
+      const last = session.messages[session.messages.length - 1];
+      if (last?.role === "assistant") last.isStreaming = false;
       this.abortController = null;
-      // 更新元数据
       session.info.messageCount = session.messages.length;
       session.info.lastPreview = lastMessagePreview(session.messages);
       this.postState();
       this.saveSessionsToDisk();
     }
+  }
+
+  private async persistIncomingAttachments(
+    sessionId: string,
+    incoming?: IncomingAttachment[]
+  ): Promise<Attachment[]> {
+    if (!incoming?.length) return [];
+    const dir = await ensureSessionAttachmentsDir(sessionId);
+    const saved: Attachment[] = [];
+
+    for (const item of incoming) {
+      const id = item.id || crypto.randomUUID();
+      const safeName = (item.name || "file").replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
+      const ext =
+        path.extname(safeName) ||
+        (item.kind === "image" ? this.extFromMime(item.mime) : "");
+      const fileName = `${id}${ext}`;
+      const filePath = path.join(dir, fileName);
+
+      try {
+        if (item.kind === "image" && item.dataUrl?.startsWith("data:")) {
+          const base64 = item.dataUrl.replace(/^data:[^;]+;base64,/, "");
+          await fsp.writeFile(filePath, Buffer.from(base64, "base64"));
+          saved.push({
+            id,
+            kind: "image",
+            mime: item.mime || "image/png",
+            name: safeName,
+            path: filePath,
+          });
+        } else if (item.kind === "text") {
+          const content = item.textContent ?? "";
+          await fsp.writeFile(filePath, content, "utf-8");
+          saved.push({
+            id,
+            kind: "text",
+            mime: item.mime || "text/plain",
+            name: safeName,
+            path: filePath,
+            textContent: content,
+          });
+        }
+      } catch (err) {
+        logError("保存附件失败:", String(err));
+        this.postError(`保存附件失败: ${safeName}`);
+      }
+    }
+    return saved;
+  }
+
+  private extFromMime(mime: string): string {
+    const map: Record<string, string> = {
+      "image/png": ".png",
+      "image/jpeg": ".jpg",
+      "image/gif": ".gif",
+      "image/webp": ".webp",
+      "image/bmp": ".bmp",
+      "image/svg+xml": ".svg",
+    };
+    return map[mime] || ".png";
+  }
+
+  private async toPromptAttachments(
+    attachments: Attachment[]
+  ): Promise<PromptAttachments | undefined> {
+    if (!attachments.length) return undefined;
+    const images: PromptAttachments["images"] = [];
+    const texts: NonNullable<PromptAttachments["texts"]> = [];
+
+    for (const a of attachments) {
+      if (a.kind === "image") {
+        images!.push({
+          mime: a.mime,
+          name: a.name,
+          path: a.path,
+          dataUrl: a.dataUrl,
+        });
+      } else if (a.kind === "text") {
+        let content = a.textContent;
+        if (content == null && a.path) {
+          try {
+            content = await fsp.readFile(a.path, "utf-8");
+          } catch (err) {
+            logError("读取文本附件失败:", String(err));
+            content = "";
+          }
+        }
+        texts.push({ name: a.name, content: content ?? "" });
+      }
+    }
+
+    return {
+      images: images!.length ? images : undefined,
+      texts: texts.length ? texts : undefined,
+    };
   }
 
   // ── 流式事件处理 ──────────────────────────────────────────────────────────
@@ -882,8 +1105,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "error":
         if (event.error) {
-          lastMsg.text += `\n\n**错误**: ${event.error}`;
-          this.postError(event.error);
+          const errText = formatErrorMessage(event.error);
+          lastMsg.text += `\n\n**错误**: ${errText}`;
+          this.postError(errText);
         }
         break;
 
@@ -921,7 +1145,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     this.postState();
-    await this.handleSendMessage(lastUserMsg.text);
+
+    // 从磁盘重读附件内容后重发
+    const incoming: IncomingAttachment[] = [];
+    for (const a of lastUserMsg.attachments ?? []) {
+      if (a.kind === "image" && a.path) {
+        try {
+          const buf = await fsp.readFile(a.path);
+          const mime = a.mime || "image/png";
+          incoming.push({
+            id: a.id,
+            kind: "image",
+            mime,
+            name: a.name,
+            dataUrl: `data:${mime};base64,${buf.toString("base64")}`,
+          });
+        } catch (err) {
+          logError("重试读取图片失败:", String(err));
+        }
+      } else if (a.kind === "text" && a.path) {
+        try {
+          const content = await fsp.readFile(a.path, "utf-8");
+          incoming.push({
+            id: a.id,
+            kind: "text",
+            mime: a.mime || "text/plain",
+            name: a.name,
+            textContent: content,
+          });
+        } catch (err) {
+          logError("重试读取文本附件失败:", String(err));
+        }
+      }
+    }
+
+    await this.handleSendMessage(lastUserMsg.text, incoming);
   }
 
   // ── Webview HTML ──────────────────────────────────────────────────────────
@@ -1186,6 +1444,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .msg-body a { color: var(--link-fg); }
   .msg-body ul { padding-left: 18px; margin: 6px 0; }
   .msg-text { line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+  .msg-text.error { color: var(--err); }
+  .msg-attachments {
+    display: flex; flex-wrap: wrap; gap: 6px;
+    margin-bottom: 6px;
+  }
+  .msg-attach-img {
+    max-width: 160px; max-height: 120px;
+    border-radius: 6px;
+    border: 1px solid var(--border-subtle);
+    object-fit: cover;
+    display: block;
+    cursor: zoom-in;
+  }
+  .msg-attach-chip {
+    display: inline-flex; align-items: center;
+    max-width: 160px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border-subtle);
+    background: var(--surface-hover);
+    font-size: 10.5px;
+    color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .streaming-cursor::after {
     content: "▍";
     animation: blink 0.8s step-end infinite;
@@ -1411,6 +1693,99 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     transition: border-color 0.15s;
   }
   .composer-box:focus-within { border-color: var(--accent); }
+  .attach-preview {
+    display: none;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 2px 2px 6px;
+  }
+  .attach-preview.has-items { display: flex; }
+  .attach-thumb {
+    position: relative;
+    width: 52px; height: 52px;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+    background: var(--surface-hover);
+    flex: 0 0 auto;
+    cursor: zoom-in;
+  }
+  .attach-thumb img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .img-lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 2000;
+    background: rgba(0,0,0,0.72);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    cursor: zoom-out;
+  }
+  .img-lightbox.show { display: flex; }
+  .img-lightbox img {
+    max-width: min(92vw, 900px);
+    max-height: 88vh;
+    object-fit: contain;
+    border-radius: 8px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+    cursor: default;
+  }
+  .img-lightbox-close {
+    position: absolute;
+    top: 12px; right: 12px;
+    width: 28px; height: 28px;
+    border: none; border-radius: 50%;
+    background: rgba(0,0,0,0.55);
+    color: #fff;
+    font-size: 18px; line-height: 28px;
+    cursor: pointer;
+    padding: 0;
+  }
+  .img-lightbox-close:hover { background: rgba(180,40,40,0.9); }
+  .attach-chip {
+    position: relative;
+    display: flex; align-items: center; gap: 4px;
+    max-width: 140px;
+    padding: 4px 22px 4px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border-subtle);
+    background: var(--surface-hover);
+    font-size: 10.5px;
+    color: var(--fg);
+  }
+  .attach-chip .aname {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .attach-remove {
+    position: absolute;
+    top: 2px; right: 2px;
+    width: 16px; height: 16px;
+    border: none; border-radius: 50%;
+    background: rgba(0,0,0,0.55);
+    color: #fff;
+    font-size: 11px; line-height: 16px;
+    cursor: pointer;
+    padding: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .attach-remove:hover { background: rgba(180,40,40,0.9); }
+  .attach-btn {
+    width: 26px; height: 26px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--muted);
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; flex: 0 0 auto;
+    padding: 0;
+  }
+  .attach-btn:hover { color: var(--fg); background: var(--surface-hover); border-color: var(--border-subtle); }
+  .attach-btn:disabled { opacity: 0.45; cursor: not-allowed; }
   .composer-box textarea {
     width: 100%;
     background: transparent;
@@ -1637,9 +2012,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
 
     <div class="composer-box">
+      <div class="attach-preview" id="attachPreview"></div>
       <textarea id="inputBox" placeholder="输入消息，Enter 发送，Shift+Enter 换行" rows="1"></textarea>
       <div class="composer-toolbar">
         <div class="left">
+          <button type="button" class="attach-btn" id="attachBtn" title="添加附件：图片或文本文件（最多5个；图片≤5MB；文本≤200KB）。不支持 PDF/Office/压缩包/音视频等" aria-label="添加附件">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          </button>
+          <input type="file" id="fileInput" multiple hidden />
           <button class="model-chip" id="modelChip">
             <span class="dot"></span>
             <span class="mname" id="modelChipName">模型</span>
@@ -1660,6 +2040,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </div>
 
   <div class="toast-container" id="toastContainer"></div>
+
+  <div class="img-lightbox" id="imgLightbox" role="dialog" aria-modal="true" aria-label="图片预览">
+    <button type="button" class="img-lightbox-close" id="imgLightboxClose" title="关闭" aria-label="关闭">×</button>
+    <img id="imgLightboxImg" alt="预览" />
+  </div>
 
 <script type="application/json" id="boot-state">${bootJson}</script>
 <script src="${scriptUri}"></script>

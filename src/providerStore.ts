@@ -278,7 +278,16 @@ export function buildOpencodeProviderConfig(
         baseURL: normalizeBaseURL(p.baseURL),
         apiKey,
       },
-      models: Object.fromEntries(p.models.map((m) => [m, { name: m }])),
+      models: Object.fromEntries(
+        p.models.map((m) => [
+          m,
+          {
+            name: m,
+            // 声明支持图片输入，避免 OpenCode 在客户端剥掉 image file parts
+            modalities: { input: ["text", "image"], output: ["text"] },
+          },
+        ])
+      ),
     };
   }
   return result;

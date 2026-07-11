@@ -6,6 +6,9 @@
     const messagesEl = $("messagesContainer");
     const inputBox = $("inputBox");
     const sendBtn = $("sendBtn");
+    const attachBtn = $("attachBtn");
+    const fileInput = $("fileInput");
+    const attachPreview = $("attachPreview");
     const sessionPicker = $("sessionPicker");
     const sessionName = $("sessionName");
     const historyDropdown = $("historyDropdown");
@@ -28,6 +31,26 @@
       '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M4 7l4-4 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
     const STOP_ICON =
       '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>';
+
+    const MAX_ATTACHMENTS = 5;
+    const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+    const MAX_TEXT_BYTES = 200 * 1024;
+    const MAX_TEXT_CHARS = 100000;
+    const IMAGE_EXTS = new Set([
+      "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg",
+    ]);
+    const BLOCKED_EXTS = new Set([
+      "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp",
+      "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "tgz",
+      "exe", "dll", "so", "dylib", "bin", "dmg", "iso", "msi", "apk",
+      "wasm", "class", "jar", "war",
+      "mp3", "mp4", "avi", "mov", "mkv", "wav", "flac", "webm",
+      "psd", "ai", "sketch", "fig",
+      "db", "sqlite", "sqlite3",
+    ]);
+
+    /** @type {{ id: string, kind: 'image'|'text', mime: string, name: string, dataUrl?: string, textContent?: string }[]} */
+    let pendingAttachments = [];
 
     let state = {
       sessionList: [],
@@ -237,6 +260,32 @@
         // 消息体
         const body = document.createElement("div");
         body.className = "msg-body";
+
+        // 附件
+        if (msg.attachments && msg.attachments.length > 0) {
+          const wrap = document.createElement("div");
+          wrap.className = "msg-attachments";
+          for (const att of msg.attachments) {
+            if (att.kind === "image" && (att.previewUrl || att.dataUrl)) {
+              const img = document.createElement("img");
+              img.className = "msg-attach-img";
+              img.src = att.previewUrl || att.dataUrl;
+              img.alt = att.name || "图片";
+              img.title = att.name || "点击放大预览";
+              img.addEventListener("click", () => {
+                openImagePreview(img.src, att.name || "图片");
+              });
+              wrap.appendChild(img);
+            } else {
+              const chip = document.createElement("span");
+              chip.className = "msg-attach-chip";
+              chip.textContent = att.name || "附件";
+              chip.title = att.name || "附件";
+              wrap.appendChild(chip);
+            }
+          }
+          body.appendChild(wrap);
+        }
 
         // 文本内容
         if (msg.text) {
@@ -791,13 +840,18 @@
         sendBtn.className = "send-btn cancel";
         sendBtn.title = "取消";
         inputBox.disabled = true;
+        if (attachBtn) attachBtn.disabled = true;
+        if (fileInput) fileInput.disabled = true;
       } else {
         sendBtn.innerHTML = SEND_ICON;
         sendBtn.className = "send-btn";
         sendBtn.title = "发送";
         inputBox.disabled = false;
+        if (attachBtn) attachBtn.disabled = false;
+        if (fileInput) fileInput.disabled = false;
         inputBox.focus();
       }
+      renderPendingAttachments();
     }
 
     function showToast(message) {
@@ -810,16 +864,230 @@
       setTimeout(() => toast.remove(), 5000);
     }
 
+    function fileExt(name) {
+      const i = (name || "").lastIndexOf(".");
+      if (i <= 0 || i === name.length - 1) return "";
+      return name.slice(i + 1).toLowerCase();
+    }
+
+    function isImageFile(file) {
+      if (file.type && file.type.startsWith("image/")) return true;
+      return IMAGE_EXTS.has(fileExt(file.name));
+    }
+
+    function isBlockedExt(name) {
+      const ext = fileExt(name);
+      return !!ext && BLOCKED_EXTS.has(ext);
+    }
+
+    function uid() {
+      return "att_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+    }
+
+    function openImagePreview(src, alt) {
+      const lightbox = $("imgLightbox");
+      const img = $("imgLightboxImg");
+      if (!lightbox || !img || !src) return;
+      img.src = src;
+      img.alt = alt || "预览";
+      lightbox.classList.add("show");
+    }
+
+    function closeImagePreview() {
+      const lightbox = $("imgLightbox");
+      const img = $("imgLightboxImg");
+      if (!lightbox) return;
+      lightbox.classList.remove("show");
+      if (img) img.removeAttribute("src");
+    }
+
+    function renderPendingAttachments() {
+      if (!attachPreview) return;
+      attachPreview.innerHTML = "";
+      if (!pendingAttachments.length) {
+        attachPreview.classList.remove("has-items");
+        return;
+      }
+      attachPreview.classList.add("has-items");
+      for (const att of pendingAttachments) {
+        if (att.kind === "image") {
+          const thumb = document.createElement("div");
+          thumb.className = "attach-thumb";
+          thumb.title = "点击放大预览";
+          const img = document.createElement("img");
+          img.src = att.dataUrl;
+          img.alt = att.name;
+          thumb.appendChild(img);
+          thumb.addEventListener("click", () => {
+            openImagePreview(att.dataUrl, att.name);
+          });
+          const rm = document.createElement("button");
+          rm.type = "button";
+          rm.className = "attach-remove";
+          rm.title = "删除";
+          rm.textContent = "×";
+          rm.disabled = state.isStreaming;
+          rm.addEventListener("click", (e) => {
+            e.stopPropagation();
+            removePendingAttachment(att.id);
+          });
+          thumb.appendChild(rm);
+          attachPreview.appendChild(thumb);
+        } else {
+          const chip = document.createElement("div");
+          chip.className = "attach-chip";
+          const name = document.createElement("span");
+          name.className = "aname";
+          name.textContent = att.name;
+          name.title = att.name;
+          chip.appendChild(name);
+          const rm = document.createElement("button");
+          rm.type = "button";
+          rm.className = "attach-remove";
+          rm.title = "删除";
+          rm.textContent = "×";
+          rm.disabled = state.isStreaming;
+          rm.addEventListener("click", (e) => {
+            e.stopPropagation();
+            removePendingAttachment(att.id);
+          });
+          chip.appendChild(rm);
+          attachPreview.appendChild(chip);
+        }
+      }
+    }
+
+    function removePendingAttachment(id) {
+      pendingAttachments = pendingAttachments.filter((a) => a.id !== id);
+      renderPendingAttachments();
+    }
+
+    function clearPendingAttachments() {
+      pendingAttachments = [];
+      renderPendingAttachments();
+    }
+
+    function readFileAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(reader.error || new Error("读取失败"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function readFileAsText(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(reader.error || new Error("读取失败"));
+        reader.readAsText(file);
+      });
+    }
+
+    async function addFiles(fileList) {
+      if (state.isStreaming) return;
+      const files = Array.from(fileList || []);
+      for (const file of files) {
+        if (pendingAttachments.length >= MAX_ATTACHMENTS) {
+          showToast(`最多添加 ${MAX_ATTACHMENTS} 个附件`);
+          break;
+        }
+        if (isBlockedExt(file.name)) {
+          showToast(`不支持的文件类型: ${file.name}`);
+          continue;
+        }
+        if (isImageFile(file)) {
+          if (file.size > MAX_IMAGE_BYTES) {
+            showToast(`图片过大（≤5MB）: ${file.name}`);
+            continue;
+          }
+          try {
+            const dataUrl = await readFileAsDataUrl(file);
+            pendingAttachments.push({
+              id: uid(),
+              kind: "image",
+              mime: file.type || "image/png",
+              name: file.name || "image.png",
+              dataUrl,
+            });
+          } catch {
+            showToast(`读取图片失败: ${file.name}`);
+          }
+        } else {
+          if (file.size > MAX_TEXT_BYTES) {
+            showToast(`文件过大（≤200KB）: ${file.name}`);
+            continue;
+          }
+          try {
+            const textContent = await readFileAsText(file);
+            if (textContent.length > MAX_TEXT_CHARS) {
+              showToast(`文件内容过长: ${file.name}`);
+              continue;
+            }
+            pendingAttachments.push({
+              id: uid(),
+              kind: "text",
+              mime: file.type || "text/plain",
+              name: file.name || "file",
+              textContent,
+            });
+          } catch {
+            showToast(`读取文件失败: ${file.name}`);
+          }
+        }
+      }
+      renderPendingAttachments();
+    }
+
+    async function addClipboardImage(file) {
+      if (state.isStreaming) return;
+      if (pendingAttachments.length >= MAX_ATTACHMENTS) {
+        showToast(`最多添加 ${MAX_ATTACHMENTS} 个附件`);
+        return;
+      }
+      if (file.size > MAX_IMAGE_BYTES) {
+        showToast("图片过大（≤5MB）");
+        return;
+      }
+      try {
+        const dataUrl = await readFileAsDataUrl(file);
+        const ext = (file.type || "image/png").split("/")[1] || "png";
+        pendingAttachments.push({
+          id: uid(),
+          kind: "image",
+          mime: file.type || "image/png",
+          name: `paste.${ext === "jpeg" ? "jpg" : ext}`,
+          dataUrl,
+        });
+        renderPendingAttachments();
+      } catch {
+        showToast("粘贴图片失败");
+      }
+    }
+
     function send() {
       if (state.isStreaming) {
         vscode.postMessage({ type: "cancelResponse" });
         return;
       }
       const text = inputBox.value.trim();
-      if (!text) return;
+      if (!text && pendingAttachments.length === 0) return;
+      const attachments = pendingAttachments.map((a) => ({
+        id: a.id,
+        kind: a.kind,
+        mime: a.mime,
+        name: a.name,
+        dataUrl: a.dataUrl,
+        textContent: a.textContent,
+      }));
       inputBox.value = "";
       autoResizeInput();
-      vscode.postMessage({ type: "sendMessage", payload: { text } });
+      clearPendingAttachments();
+      vscode.postMessage({
+        type: "sendMessage",
+        payload: { text, attachments },
+      });
     }
 
     // ── Event listeners ──
@@ -889,9 +1157,53 @@
         send();
       }
     });
+    inputBox?.addEventListener("paste", (e) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      let handledImage = false;
+      for (const item of items) {
+        if (item.type && item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) {
+            e.preventDefault();
+            void addClipboardImage(file);
+            handledImage = true;
+            break;
+          }
+        }
+      }
+      if (handledImage) return;
+    });
+
+    attachBtn?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (state.isStreaming) return;
+      fileInput?.click();
+    });
+
+    fileInput?.addEventListener("change", () => {
+      if (fileInput.files?.length) {
+        void addFiles(fileInput.files);
+      }
+      fileInput.value = "";
+    });
 
     // Send button
     sendBtn?.addEventListener("click", send);
+
+    // Image lightbox
+    const imgLightbox = $("imgLightbox");
+    const imgLightboxClose = $("imgLightboxClose");
+    const imgLightboxImg = $("imgLightboxImg");
+    imgLightboxClose?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeImagePreview();
+    });
+    imgLightbox?.addEventListener("click", () => closeImagePreview());
+    imgLightboxImg?.addEventListener("click", (e) => e.stopPropagation());
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeImagePreview();
+    });
 
     // ── Webview messages from extension ──
 

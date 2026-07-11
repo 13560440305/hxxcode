@@ -55,6 +55,17 @@ export function getSessionPath(sessionId: string): string {
   return path.join(getSessionsDir(), `${sessionId}.json`);
 }
 
+/** 会话附件目录：~/.hxxcode/sessions/{sessionId}/attachments/ */
+export function getSessionAttachmentsDir(sessionId: string): string {
+  return path.join(getSessionsDir(), sessionId, "attachments");
+}
+
+export async function ensureSessionAttachmentsDir(sessionId: string): Promise<string> {
+  const dir = getSessionAttachmentsDir(sessionId);
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+
 export function getArchiveSessionPath(sessionId: string): string {
   return path.join(getArchiveDir(), `${sessionId}.json`);
 }
