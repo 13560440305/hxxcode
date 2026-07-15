@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as fs from "fs/promises";
 import type { OpencodeClient, PermissionReply, PermissionRequest } from "@opencode-ai/sdk";
 import { ProviderStore, buildOpencodeProviderConfig, envVarName } from "./providerStore";
-import { log, logError, isDebugEnabled } from "./log";
+import { logError, logInfo, showDiag } from "./log";
 import { getOpencodeConfigPath, ensureOpencodeDirs, readJSON } from "./storage";
 
 // ── Stream event types ───────────────────────────────────────────────────────
@@ -71,16 +71,61 @@ export function formatErrorMessage(err: unknown): string {
 }
 
 function friendlyProviderError(message: string): string {
+  // 避免 formatErrorMessage 递归把已友好化文案再包一层
+  if (
+    message.includes("请执行「HxxCode: 启动 / 重启 Server」") ||
+    message.includes("常见原因：①")
+  ) {
+    return message;
+  }
+  if (/404|Not Found/i.test(message) && /bigmodel|open\.bigmodel|智谱|glm/i.test(message)) {
+    return (
+      "HTTP 404：智谱 API 地址不正确。Base URL 请填 https://open.bigmodel.cn/api/paas/v4（不要带 /chat/completions）。" +
+      "保存后重新加载窗口，再试聊天或拉取模型列表。\n\n" +
+      `详情: ${message}`
+    );
+  }
+  if (/404|Not Found/i.test(message) && /chat\/completions/i.test(message)) {
+    return (
+      "HTTP 404：供应商 API 地址被拼错（常见原因：Base URL 多填了 /chat/completions，或路径里重复出现 /v1）。" +
+      "请只填 API 根地址，例如智谱 https://open.bigmodel.cn/api/paas/v4、DeepSeek https://api.deepseek.com。" +
+      "保存后重新加载窗口。\n\n" +
+      `详情: ${message}`
+    );
+  }
+  if (/模型未响应|agent 在 30s 内未启动|等待 OpenCode 响应超时|后端可能已卡住/i.test(message)) {
+    return (
+      "对话事件丢失或 Agent 启动超时（智谱接口本身往往已成功）。" +
+      "请重载窗口后执行「HxxCode: 启动 / 重启 Server」，再新建会话。" +
+      "看图请用 glm-4.6v / glm-5v-turbo。\n\n" +
+      `详情: ${message}`
+    );
+  }
   if (/image_url|unknown variant `image`|expected `text`|does not support image|type=\"image\"|Not Supported/i.test(message)) {
     return (
       "当前供应商 API 不接受图片内容（仅支持 text）。" +
       "DeepSeek 官方 API（api.deepseek.com）目前为纯文本接口，即使 deepseek-v4-pro 也不能直接传 image_url；" +
       "Claude Code 等工具若能「看图」，通常是先用其它 Vision 模型转成文字再发给 DeepSeek。" +
-      "请改用支持多模态的供应商/模型（如 OpenAI GPT-4o、带 Vision 的中转），或改用文字描述截图。\n\n" +
+      "请改用支持多模态的供应商/模型（如 OpenAI GPT-4o、带 Vision 的中转），或改用文字描述截图。" +
+      "发送纯文字消息时会自动跳过历史图片，无需新建会话。\n\n" +
       `详情: ${message}`
     );
   }
   return message;
+}
+
+/** 是否为「SSE 未收到 step / Agent 未启动」类超时 */
+export function isAgentStartTimeoutError(message: string): boolean {
+  return /模型未响应|agent 在 30s 内未启动|等待 OpenCode 响应超时|后端可能已卡住/i.test(
+    message
+  );
+}
+
+/** 是否为「模型/API 不支持图片」类错误 */
+export function isImageUnsupportedError(message: string): boolean {
+  return /image_url|unknown variant `image`|expected `text`|does not support image|type=\"image\"|Not Supported/i.test(
+    message
+  );
 }
 
 /** 把用户输入与文本附件拼成最终 prompt 文本 */
@@ -116,6 +161,10 @@ export class OpencodeManager implements vscode.Disposable {
   private permissionHandler:
     | ((request: PermissionRequest) => Promise<PermissionReply>)
     | null = null;
+  /** 当前 step 是否已收到 text.delta（避免 text.ended 全量再追加一次） */
+  private sawTextDeltaInStep = false;
+  /** 本次 prompt 开始时间，恢复时只接受此之后的 assistant */
+  private lastPromptStartedAt = 0;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -135,9 +184,12 @@ export class OpencodeManager implements vscode.Disposable {
   }
 
   private flow(step: string, detail?: unknown): void {
-    if (!isDebugEnabled()) return;
-    const msg = detail !== undefined ? `${step} ${typeof detail === "string" ? detail : JSON.stringify(detail)}` : step;
-    log("[flow/opencode]", msg);
+    const msg =
+      detail !== undefined
+        ? `${step} ${typeof detail === "string" ? detail : JSON.stringify(detail)}`
+        : step;
+    // 流程日志始终打到「HxxCode 诊断」，方便排查卡住
+    logInfo("[flow]", msg);
   }
 
   private async doStart(): Promise<void> {
@@ -153,10 +205,9 @@ export class OpencodeManager implements vscode.Disposable {
     this.flow("buildEnv", { keys: envKeys, hasKeys: envKeys.length > 0 });
 
     const { createOpencode } = await import("@opencode-ai/sdk");
-    const sdkLog = isDebugEnabled() ? (msg: string) => log("[opencode/sdk]", msg) : undefined;
-    const sdkStderr = isDebugEnabled()
-      ? (text: string) => log("[opencode/stderr]", text.trimEnd())
-      : undefined;
+    // SDK / stderr 步骤日志始终写入诊断通道
+    const sdkLog = (msg: string) => logInfo("[opencode/sdk]", msg);
+    const sdkStderr = (text: string) => logInfo("[opencode/stderr]", text.trimEnd());
     this.server = await createOpencode({
       config: { cwd: this.workspaceRoot },
       env,
@@ -311,57 +362,211 @@ export class OpencodeManager implements vscode.Disposable {
     const textLen = parts.find((p) => p.type === "text")?.text?.length ?? 0;
     const fileCount = parts.filter((p) => p.type === "file").length;
 
+    this.lastPromptStartedAt = Date.now();
+    this.sawTextDeltaInStep = false;
     this.flow("promptStream 开始", {
       sessionId,
       model: `${provider.id}/${model}`,
       textLen,
       fileCount,
+      promptStartedAt: this.lastPromptStartedAt,
     });
+    showDiag(true);
 
-    const result = await client.session.prompt({
+    if (signal?.aborted) {
+      this.flow("promptStream 已取消 (发送前)");
+      return;
+    }
+
+    this.flow("promptStream 调用 session.prompt（先提交 prompt，再连 SSE）");
+
+    const result = client.session.prompt({
       path: { id: sessionId },
       body: {
         model: `${provider.id}/${model}`,
         parts,
       },
+      signal,
     });
 
     const iterable = result as AsyncIterable<Record<string, unknown>>;
+    const iterator =
+      typeof (iterable as AsyncIterable<Record<string, unknown>>)[Symbol.asyncIterator] ===
+      "function"
+        ? (iterable as AsyncIterable<Record<string, unknown>>)[Symbol.asyncIterator]()
+        : null;
+
     let finished = false;
     let chunkCount = 0;
+    let gotText = false;
+    const onAbort = () => {
+      void iterator?.return?.();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    const emit = (event: StreamEvent) => {
+      if (event.type === "finish") finished = true;
+      if (event.type === "text" && event.text) gotText = true;
+      onEvent(event);
+    };
+
     try {
-      for await (const chunk of iterable) {
-        chunkCount++;
-        if (signal?.aborted) {
-          this.flow("promptStream 已取消", { chunks: chunkCount });
-          break;
+      if (!iterator) {
+        for await (const chunk of iterable) {
+          chunkCount++;
+          if (signal?.aborted) break;
+          this.handlePromptChunk(chunk, chunkCount, emit);
         }
-        const chunkType = (chunk as Record<string, unknown>).type;
-        if (chunkCount <= 20 || TERMINAL_CHUNK_TYPES.has(String(chunkType))) {
-          this.flow(`promptStream chunk #${chunkCount}`, chunkType);
-        } else if (chunkCount === 21) {
-          this.flow("promptStream …后续 chunk 省略");
+      } else {
+        while (true) {
+          if (signal?.aborted) {
+            this.flow("promptStream 已取消", { chunks: chunkCount });
+            await iterator.return?.();
+            break;
+          }
+          const next = await iterator.next();
+          if (next.done) break;
+          chunkCount++;
+          this.handlePromptChunk(next.value, chunkCount, emit);
         }
-        this.interpretChunk(chunk, (event) => {
-          if (event.type === "finish") finished = true;
-          onEvent(event);
-        });
+      }
+
+      // SSE/生成器结束后仍无正文：再捞一次（复杂识图常见）
+      if (!gotText && !finished && !signal?.aborted) {
+        this.flow("promptStream 结束后无正文，尝试延迟恢复…");
+        const recovered = await this.tryRecoverAssistantTextWithWait(
+          sessionId,
+          signal,
+          90_000
+        );
+        if (recovered) {
+          this.flow("promptStream 延迟恢复成功", { textLen: recovered.length });
+          emit({ type: "text", text: recovered });
+          emit({ type: "finish" });
+        } else {
+          this.flow("promptStream 延迟恢复仍无正文");
+          emit({
+            type: "error",
+            error:
+              "模型未返回正文（复杂识图时 SSE 可能提前断开）。请新建会话重试，或换用 glm-4.6v。",
+          });
+          emit({ type: "finish" });
+        }
       }
     } catch (err) {
-      if (finished || this.isBenignStreamError(err)) {
-        this.flow("promptStream 结束 (benign)", { chunks: chunkCount, ms: Date.now() - t0 });
+      if (finished || signal?.aborted || this.isBenignStreamError(err)) {
+        this.flow("promptStream 结束 (benign)", {
+          chunks: chunkCount,
+          aborted: !!signal?.aborted,
+          ms: Date.now() - t0,
+        });
         return;
       }
+
+      const errMsg = formatErrorMessage(err);
+      if (isAgentStartTimeoutError(errMsg) && !signal?.aborted) {
+        const recovered = await this.tryRecoverAssistantTextWithWait(
+          sessionId,
+          signal,
+          60_000
+        );
+        if (recovered) {
+          this.flow("promptStream SSE 超时但已从消息接口恢复结果", {
+            textLen: recovered.length,
+            ms: Date.now() - t0,
+          });
+          emit({ type: "text", text: recovered });
+          emit({ type: "finish" });
+          return;
+        }
+      }
+
       this.flow("promptStream 错误", {
-        err: formatErrorMessage(err),
+        err: errMsg,
         chunks: chunkCount,
         ms: Date.now() - t0,
       });
-      onEvent({ type: "error", error: formatErrorMessage(err) });
+      emit({ type: "error", error: errMsg });
       return;
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
     }
-    if (!signal?.aborted && !finished) onEvent({ type: "finish" });
-    this.flow("promptStream 完成", { chunks: chunkCount, finished, ms: Date.now() - t0 });
+    if (!signal?.aborted && !finished) emit({ type: "finish" });
+    this.flow("promptStream 完成", {
+      chunks: chunkCount,
+      finished,
+      gotText,
+      aborted: !!signal?.aborted,
+      ms: Date.now() - t0,
+    });
+  }
+
+  /** SSE 丢事件时，只捞「本次 prompt 之后」完成的 assistant 文本 */
+  private async tryRecoverAssistantText(sessionId: string): Promise<string | null> {
+    try {
+      const client = await this.ensureClient();
+      if (!client.session.listMessages) return null;
+      const res = await client.session.listMessages(sessionId);
+      const messages = res.data ?? [];
+      const afterMs = this.lastPromptStartedAt || 0;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (msg?.type !== "assistant") continue;
+        const created = Number(msg.time?.created ?? 0);
+        if (afterMs && created && created < afterMs) continue;
+        if (!msg.time?.completed && !(msg as { finish?: string }).finish) continue;
+        const texts = (msg.content ?? [])
+          .filter((c) => c?.type === "text" && typeof c.text === "string")
+          .map((c) => c.text as string);
+        const text = texts.join("\n").trim();
+        if (text) {
+          this.flow("tryRecoverAssistantText 命中本次回复", {
+            messageId: msg.id,
+            created,
+            textLen: text.length,
+          });
+          return text;
+        }
+      }
+    } catch (err) {
+      this.flow("tryRecoverAssistantText 失败", formatErrorMessage(err));
+    }
+    return null;
+  }
+
+  /** 复杂识图时 Agent 可能晚于 SSE 结束，周期性重试捞正文 */
+  private async tryRecoverAssistantTextWithWait(
+    sessionId: string,
+    signal: AbortSignal | undefined,
+    timeoutMs: number
+  ): Promise<string | null> {
+    const t0 = Date.now();
+    let attempt = 0;
+    while (!signal?.aborted && Date.now() - t0 < timeoutMs) {
+      attempt++;
+      const text = await this.tryRecoverAssistantText(sessionId);
+      if (text) return text;
+      this.flow("tryRecoverAssistantTextWithWait 等待中", {
+        attempt,
+        elapsedMs: Date.now() - t0,
+      });
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    return null;
+  }
+
+  private handlePromptChunk(
+    chunk: Record<string, unknown>,
+    chunkCount: number,
+    onEvent: (event: StreamEvent) => void
+  ): void {
+    const chunkType = chunk.type;
+    if (chunkCount <= 20 || TERMINAL_CHUNK_TYPES.has(String(chunkType))) {
+      this.flow(`promptStream chunk #${chunkCount}`, chunkType);
+    } else if (chunkCount === 21) {
+      this.flow("promptStream …后续 chunk 省略");
+    }
+    this.interpretChunk(chunk, onEvent);
   }
 
   private async buildPromptParts(
@@ -464,16 +669,26 @@ export class OpencodeManager implements vscode.Disposable {
     const type = chunk.type as string | undefined;
 
     // OpenCode 2.0 SSE 事件（session.next.*）
+    if (type === "session.next.step.started") {
+      this.sawTextDeltaInStep = false;
+      return;
+    }
     if (type === "session.next.text.delta") {
       const data = chunk.data as Record<string, unknown> | undefined;
       const delta = (data?.delta ?? data?.text) as string | undefined;
-      if (delta) onEvent({ type: "text", text: delta });
+      if (delta) {
+        this.sawTextDeltaInStep = true;
+        onEvent({ type: "text", text: delta });
+      }
       return;
     }
     if (type === "session.next.text.ended") {
       const data = chunk.data as Record<string, unknown> | undefined;
       const text = data?.text as string | undefined;
-      if (text) onEvent({ type: "text", text });
+      // 已有流式 delta 时不再追加 ended 全量文本，否则同一段会重复两遍
+      if (text && !this.sawTextDeltaInStep) {
+        onEvent({ type: "text", text });
+      }
       return;
     }
     if (type === "session.next.step.failed") {
@@ -573,11 +788,18 @@ export class OpencodeManager implements vscode.Disposable {
     const providerConfig = buildOpencodeProviderConfig(this.providerStore.list(), apiKeys);
     const configPath = getOpencodeConfigPath();
     const existing = await readJSON<Record<string, unknown>>(configPath, {});
+    const existingProviders =
+      ((existing.provider as Record<string, unknown>) ?? {}) as Record<string, unknown>;
+    const managedIds = new Set(this.providerStore.list().map((p) => p.id));
+    const preservedProviders: Record<string, unknown> = {};
+    for (const [id, cfg] of Object.entries(existingProviders)) {
+      if (!managedIds.has(id)) preservedProviders[id] = cfg;
+    }
     const merged = {
       ...existing,
       $schema: existing.$schema ?? "https://opencode.ai/config.json",
       provider: {
-        ...((existing.provider as Record<string, unknown>) ?? {}),
+        ...preservedProviders,
         ...providerConfig,
       },
     };

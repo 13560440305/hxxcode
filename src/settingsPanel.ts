@@ -81,24 +81,24 @@ export class SettingsPanel {
           config: ProviderConfig;
           apiKey: string;
         };
-        await this.providerStore.upsertProvider(config, apiKey);
-        if (this.opencodeManager) {
-          await this.opencodeManager.restart();
-        }
-        vscode.window.showInformationMessage(`供应商「${config.name}」已保存`);
-        this.postState();
+        const saved = await this.providerStore.upsertProvider(config, apiKey);
+        this.postState(saved.id);
         ChatViewProvider.notifyProviderChanged();
+        if (this.opencodeManager) {
+          void this.opencodeManager.restart();
+        }
+        vscode.window.showInformationMessage(`供应商「${saved.name}」已保存`);
         break;
       }
 
       case "removeProvider": {
         const { id } = message.payload as { id: string };
         await this.providerStore.removeProvider(id);
-        if (this.opencodeManager) {
-          await this.opencodeManager.restart();
-        }
         this.postState();
         ChatViewProvider.notifyProviderChanged();
+        if (this.opencodeManager) {
+          void this.opencodeManager.restart();
+        }
         break;
       }
 
@@ -125,7 +125,7 @@ export class SettingsPanel {
     }
   }
 
-  private postState(): void {
+  private postState(savedProviderId?: string): void {
     const { provider, model } = this.providerStore.getActive();
     this.panel.webview.postMessage({
       type: "state",
@@ -133,6 +133,7 @@ export class SettingsPanel {
         providers: this.providerStore.list(),
         activeProviderId: provider?.id ?? null,
         activeModel: model,
+        ...(savedProviderId ? { savedProviderId } : {}),
       },
     });
   }
@@ -599,6 +600,14 @@ export class SettingsPanel {
   let state = { providers: [], activeProviderId: null, activeModel: null };
   let currentEditId = null;
   let pendingModels = [];
+  let saving = false;
+
+  function setSaveButtonsDisabled(disabled) {
+    const btn1 = $("saveBtn");
+    const btn2 = $("saveBtn2");
+    if (btn1) btn1.disabled = disabled;
+    if (btn2) btn2.disabled = disabled;
+  }
 
   // ── Dynamic color for provider dot ──
   const DOT_COLORS = [
@@ -616,8 +625,13 @@ export class SettingsPanel {
 
   function renderState(payload) {
     state = payload;
+    saving = false;
+    setSaveButtonsDisabled(false);
+    if (payload.savedProviderId) {
+      currentEditId = payload.savedProviderId;
+    }
     renderProviders();
-    // 如果正在新建中（ID 以 new- 开头），保持编辑表单不重置
+    // 新建尚未保存时，保持编辑表单不重置
     if (currentEditId && currentEditId.startsWith("new-")) {
       showEditForm();
       return;
@@ -706,7 +720,8 @@ export class SettingsPanel {
       input.focus();
       return;
     }
-    if (!pendingModels.includes(name)) {
+    const lowerName = name.toLowerCase();
+    if (!pendingModels.some((m) => m.toLowerCase() === lowerName)) {
       pendingModels.push(name);
     }
     modelInputOpen = false;
@@ -817,14 +832,43 @@ export class SettingsPanel {
     return s;
   }
 
+  function normalizeMatchUrl(baseURL) {
+    let s = (baseURL || "").trim().toLowerCase();
+    if (s.indexOf("https://") === 0) s = s.slice(8);
+    else if (s.indexOf("http://") === 0) s = s.slice(7);
+    while (s.endsWith("/")) s = s.slice(0, -1);
+    if (s.endsWith("/chat/completions")) s = s.slice(0, -"/chat/completions".length);
+    if (s.endsWith("/v1")) s = s.slice(0, -3);
+    while (s.endsWith("/")) s = s.slice(0, -1);
+    return s;
+  }
+
+  function findExistingProvider(name, baseURL) {
+    const keyName = name.trim().toLowerCase();
+    const keyUrl = normalizeMatchUrl(baseURL);
+    for (const p of state.providers) {
+      if (
+        p.name.trim().toLowerCase() === keyName &&
+        normalizeMatchUrl(p.baseURL) === keyUrl
+      ) {
+        return p;
+      }
+    }
+    return null;
+  }
+
   function getFormConfig() {
     let id = currentEditId;
     const name = $("editName").value.trim();
     if (!name) { alert("请输入供应商名称"); return null; }
-    // 如果是新建（id 以 new- 开头），生成新的 id
+    const baseURL = $("editBaseURL").value.trim();
     if (!id || id.startsWith("new-")) {
-      const slug = slugifyId(name) || "provider";
-      id = slug + "-" + Date.now().toString(36);
+      const existing = findExistingProvider(name, baseURL);
+      if (existing) {
+        id = existing.id;
+      } else {
+        id = "new-" + Date.now().toString(36);
+      }
     }
     return {
       config: {
@@ -859,8 +903,11 @@ export class SettingsPanel {
   $("addBtn")?.addEventListener("click", startNewProvider);
 
   function save() {
+    if (saving) return;
     const data = getFormConfig();
     if (!data) return;
+    saving = true;
+    setSaveButtonsDisabled(true);
     vscode.postMessage({ type: "saveProvider", payload: data });
   }
 

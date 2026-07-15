@@ -39,11 +39,23 @@ export interface SessionPromptBody {
 export interface PromptOptions {
   path: { id: string };
   body: SessionPromptBody;
+  /** 取消时中断 SSE / 进行中的 HTTP 请求 */
+  signal?: AbortSignal;
 }
 
 export interface SessionClient {
   create(body: { body: { title?: string; model?: string } }): Promise<SessionCreateResponse>;
   get?(sessionId: string): Promise<{ data: { id: string } | null }>;
+  /** 拉取会话消息（SSE 丢事件时用于兜底） */
+  listMessages?(sessionId: string): Promise<{
+    data: Array<{
+      id?: string;
+      type?: string;
+      finish?: string;
+      content?: Array<{ type?: string; text?: string }>;
+      time?: { created?: number; completed?: number };
+    }>;
+  }>;
   prompt(options: PromptOptions): AsyncIterable<StreamChunk>;
   switchModel?(sessionId: string, modelRef: { providerID: string; id: string }): Promise<void>;
 }

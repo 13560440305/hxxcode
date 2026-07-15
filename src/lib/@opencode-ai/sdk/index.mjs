@@ -592,6 +592,224 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** 从 /message 列表取「本次 prompt 之后」最新完成的 assistant 文本 */
+async function fetchLatestAssistantText(
+  api,
+  sessionId,
+  signal,
+  { afterMessageId = null, afterMs = 0 } = {}
+) {
+  const res = await api(`/session/${sessionId}/message`, { signal });
+  if (!res.ok) return null;
+  const json = await res.json().catch(() => ({}));
+  const messages = json?.data ?? json;
+  if (!Array.isArray(messages)) return null;
+
+  let minIndex = 0;
+  if (afterMessageId) {
+    const idx = messages.findIndex((m) => m?.id === afterMessageId);
+    if (idx >= 0) minIndex = idx + 1;
+  }
+
+  for (let i = messages.length - 1; i >= minIndex; i--) {
+    const msg = messages[i];
+    if (msg?.type !== "assistant") continue;
+    if (!msg.time?.completed && msg.finish == null) continue;
+    const created = Number(msg.time?.created ?? 0);
+    // 必须是本次 prompt 之后创建的 assistant，避免把上一轮结果当成新回复
+    if (afterMs && created && created < afterMs) continue;
+    const texts = (msg.content ?? [])
+      .filter((c) => c?.type === "text" && typeof c.text === "string")
+      .map((c) => c.text);
+    const text = texts.join("\n").trim();
+    if (text) {
+      return {
+        text,
+        messageId: msg.id,
+        finish: msg.finish ?? "stop",
+        created,
+      };
+    }
+  }
+  return null;
+}
+
+/** SSE 不可用时，轮询消息直到「本次」assistant 完成 */
+async function* pollSessionMessagesAsEvents({
+  api,
+  sessionId,
+  signal,
+  log,
+  messageId,
+  afterMs = 0,
+  timeoutMs = 90_000,
+}) {
+  const t0 = Date.now();
+  log(
+    `开始轮询 /session/${sessionId}/message … afterMessageId=${messageId ?? "?"} afterMs=${afterMs}`
+  );
+  while (!signal?.aborted) {
+    if (Date.now() - t0 > timeoutMs) {
+      throw new Error(
+        "轮询消息超时：Agent 未在限时内产出结果。请重启 HxxCode Server 后新建会话。"
+      );
+    }
+    try {
+      const hit = await fetchLatestAssistantText(api, sessionId, signal, {
+        afterMessageId: messageId,
+        afterMs,
+      });
+      if (hit) {
+        log(
+          `轮询命中本次 assistant 文本 len=${hit.text.length} messageID=${hit.messageId ?? "?"}`
+        );
+        yield {
+          type: "session.next.step.started",
+          data: { sessionID: sessionId, assistantMessageID: hit.messageId },
+        };
+        // 只发一次完整文本（delta），避免再发 text.ended 造成重复
+        yield {
+          type: "session.next.text.delta",
+          data: { sessionID: sessionId, delta: hit.text },
+        };
+        yield {
+          type: "session.next.step.ended",
+          data: {
+            sessionID: sessionId,
+            finish: hit.finish || "stop",
+            assistantMessageID: hit.messageId,
+          },
+        };
+        return;
+      }
+    } catch (err) {
+      if (isStreamTerminationError(err) || signal?.aborted) return;
+      log(`轮询消息出错: ${err.message}`);
+    }
+    await sleep(1000);
+  }
+}
+
+/**
+ * SSE 与消息轮询并行。
+ * 复杂识图时常出现：SSE 在 text.started 后提前断开，Agent 仍在跑 —— 此时必须继续轮询 /message。
+ */
+async function* mergeSseWithMessagePoll(sseIter, pollOpts) {
+  const {
+    api,
+    sessionId,
+    signal,
+    log,
+    messageId,
+    afterMs = 0,
+    pollTimeoutMs = 180_000,
+  } = pollOpts;
+  const iter = sseIter[Symbol.asyncIterator]();
+  let stopped = false;
+  let sseFinishedClean = false;
+  /** 是否已收到带正文的 delta/ended（text.started 不算） */
+  let sawSseTextBody = false;
+  let pollHit = null;
+
+  const pollLoop = (async () => {
+    await sleep(2000);
+    while (!stopped && !signal?.aborted) {
+      try {
+        const hit = await fetchLatestAssistantText(api, sessionId, signal, {
+          afterMessageId: messageId,
+          afterMs,
+        });
+        if (hit) {
+          pollHit = hit;
+          log(
+            `并行轮询命中本次结果 len=${hit.text.length} messageID=${hit.messageId ?? "?"}`
+          );
+          try {
+            await iter.return?.();
+          } catch {
+            // ignore
+          }
+          return;
+        }
+      } catch {
+        // ignore transient
+      }
+      await sleep(1500);
+    }
+  })();
+
+  try {
+    while (!stopped && !signal?.aborted) {
+      const next = await iter.next();
+      if (pollHit) break;
+      if (next.done) {
+        log(
+          `SSE 流结束 (clean=${sseFinishedClean}, sawTextBody=${sawSseTextBody}, pollHit=${!!pollHit})`
+        );
+        break;
+      }
+      const t = next.value?.type;
+      if (t === "session.next.text.delta") {
+        const delta = next.value?.data?.delta ?? next.value?.data?.text;
+        if (typeof delta === "string" && delta.length > 0) sawSseTextBody = true;
+      }
+      if (t === "session.next.text.ended") {
+        const text = next.value?.data?.text;
+        if (typeof text === "string" && text.trim()) sawSseTextBody = true;
+      }
+      yield next.value;
+      if (t === "session.next.step.failed" || isFinalStepEnded(next.value)) {
+        sseFinishedClean = true;
+        stopped = true;
+        break;
+      }
+    }
+  } finally {
+    // 仅在已有正文或干净结束时停掉并行轮询；否则留给后面的续轮询
+    if (sseFinishedClean || sawSseTextBody || pollHit) {
+      stopped = true;
+    }
+    await pollLoop.catch(() => {});
+  }
+
+  if (signal?.aborted) return;
+
+  if (pollHit && !sawSseTextBody) {
+    log(`使用并行轮询结果作为正文 len=${pollHit.text.length}`);
+    yield {
+      type: "session.next.text.delta",
+      data: { sessionID: sessionId, delta: pollHit.text },
+    };
+    yield {
+      type: "session.next.step.ended",
+      data: {
+        sessionID: sessionId,
+        finish: pollHit.finish || "stop",
+        assistantMessageID: pollHit.messageId,
+      },
+    };
+    return;
+  }
+
+  if (sseFinishedClean || sawSseTextBody) {
+    return;
+  }
+
+  // SSE 提前断开且没有正文：继续轮询（复杂图片 / 长思考）
+  log(
+    `SSE 提前结束且无正文，继续轮询 /message（最长 ${Math.round(pollTimeoutMs / 1000)}s）…`
+  );
+  yield* pollSessionMessagesAsEvents({
+    api,
+    sessionId,
+    signal,
+    log,
+    messageId,
+    afterMs,
+    timeoutMs: pollTimeoutMs,
+  });
+}
+
 async function* parseSessionEventsWithPermissions(
   response,
   signal,
@@ -645,7 +863,9 @@ async function* parseSessionEvents(
   const iter = parseSSE(response, signal, log)[Symbol.asyncIterator]();
   let eventCount = 0;
   let yieldedCount = 0;
-  let promptedAt = null;
+  /** 绝对截止时间，避免 SSE 心跳不断刷新等待导致永不超时 */
+  let deadlineAt = Date.now() + Math.min(idleTimeoutMs, 45_000);
+  let waitingAgentStart = false;
   const agentStartTimeoutMs = 30_000;
   const targetMessageId = promptFilter?.messageId ?? null;
   let active = !targetMessageId;
@@ -660,22 +880,24 @@ async function* parseSessionEvents(
       let timer;
       let next;
       const waitStart = Date.now();
-      const waitLimitMs = promptedAt
-        ? Math.max(500, agentStartTimeoutMs - (Date.now() - promptedAt))
-        : idleTimeoutMs;
+      const waitLimitMs = Math.max(500, deadlineAt - Date.now());
       try {
         next = await Promise.race([
           iter.next(),
           new Promise((_, reject) => {
             timer = setTimeout(() => {
-              if (promptedAt && Date.now() - promptedAt >= agentStartTimeoutMs) {
+              if (waitingAgentStart) {
                 reject(
                   new Error(
-                    "模型未响应：agent 在 30s 内未启动。请检查供应商配置、API Key 和模型名称是否正确（OpenCode 配置路径：~/.config/opencode/opencode.jsonc）"
+                    "模型未响应：agent 在 30s 内未启动。OpenCode 后端可能已卡住，请执行「HxxCode: 启动 / 重启 Server」后新建会话重试。"
                   )
                 );
               } else {
-                reject(new Error("等待 OpenCode 响应超时（120s）"));
+                reject(
+                  new Error(
+                    "等待 OpenCode 响应超时。后端可能已卡住，请执行「HxxCode: 启动 / 重启 Server」后新建会话重试。"
+                  )
+                );
               }
             }, waitLimitMs);
           }),
@@ -701,6 +923,8 @@ async function* parseSessionEvents(
       if (!active) {
         if (evType === "session.next.prompted" && matchesPromptMessage(ev, targetMessageId)) {
           active = true;
+          waitingAgentStart = true;
+          deadlineAt = Date.now() + agentStartTimeoutMs;
           log(`SSE 锁定当前 prompt messageID=${targetMessageId} (+${Date.now() - waitStart}ms)`);
         } else {
           log(`← SSE #${eventCount} ${evType} (跳过历史 replay)`);
@@ -710,10 +934,22 @@ async function* parseSessionEvents(
 
       log(`← SSE #${eventCount} ${evType} (+${Date.now() - waitStart}ms)`);
       if (evType === "session.next.prompted") {
-        promptedAt = Date.now();
+        waitingAgentStart = true;
+        deadlineAt = Date.now() + agentStartTimeoutMs;
       }
       if (evType === "session.next.step.started") {
-        promptedAt = null;
+        waitingAgentStart = false;
+        // 生成过程中允许更长空闲（但不会因心跳无限延长）
+        deadlineAt = Date.now() + idleTimeoutMs;
+      }
+      if (
+        evType === "session.next.text.delta" ||
+        evType === "session.next.text.started" ||
+        evType === "session.next.reasoning.started" ||
+        evType === "session.next.tool.called"
+      ) {
+        waitingAgentStart = false;
+        deadlineAt = Date.now() + idleTimeoutMs;
       }
       if (evType === "session.next.text.ended") {
         const text = ev?.data?.text;
@@ -735,6 +971,7 @@ async function* parseSessionEvents(
       }
       if (evType === "session.next.step.ended") {
         log(`SSE step.ended finish=${ev?.data?.finish ?? "?"}，继续等待后续步骤…`);
+        deadlineAt = Date.now() + idleTimeoutMs;
       }
     }
   } finally {
@@ -902,6 +1139,18 @@ function createHttpClient(baseURL, auth, directory, log = () => {}, onPermission
         const json = await res.json();
         return { data: json.data ?? json };
       },
+      async listMessages(sessionId) {
+        log(`拉取 session 消息: ${sessionId}`);
+        const res = await api(`/session/${sessionId}/message`);
+        if (!res.ok) {
+          throw new Error(
+            `拉取消息失败 (${res.status}): ${await res.text()}`
+          );
+        }
+        const json = await res.json();
+        const data = json.data ?? json;
+        return { data: Array.isArray(data) ? data : [] };
+      },
       async switchModel(sessionId, modelRef) {
         const res = await api(`/session/${sessionId}/model`, {
           method: "POST",
@@ -916,7 +1165,20 @@ function createHttpClient(baseURL, auth, directory, log = () => {}, onPermission
       prompt(options) {
         const { id } = options.path;
         const abortController = new AbortController();
+        const externalSignal = options.signal;
+        if (externalSignal) {
+          if (externalSignal.aborted) {
+            abortController.abort();
+          } else {
+            externalSignal.addEventListener(
+              "abort",
+              () => abortController.abort(),
+              { once: true }
+            );
+          }
+        }
         const modelRef = parseModelRef(options.body?.model);
+        const fetchSignal = abortController.signal;
 
         return {
           [Symbol.asyncIterator]() {
@@ -925,12 +1187,16 @@ function createHttpClient(baseURL, auth, directory, log = () => {}, onPermission
             let completed = false;
 
             const start = async () => {
+              if (fetchSignal.aborted) {
+                throw new DOMException("The operation was aborted", "AbortError");
+              }
               log(`── prompt 流程开始 session=${id} ──`);
               if (modelRef) {
                 log(`切换模型: ${JSON.stringify(modelRef)}`);
                 const modelRes = await api(`/session/${id}/model`, {
                   method: "POST",
                   body: JSON.stringify({ model: modelRef }),
+                  signal: fetchSignal,
                 });
                 if (!modelRes.ok) {
                   throw new Error(
@@ -971,9 +1237,14 @@ function createHttpClient(baseURL, auth, directory, log = () => {}, onPermission
               const promptPayload =
                 files.length > 0 ? { text, files } : { text };
 
+              // 必须先提交 prompt 再连 SSE。
+              // 部分 OpenCode 版本在 GET /event 时要等首个事件才返回响应头；
+              // 若先挂起 SSE、再 POST prompt，会形成死锁（日志停在 → HTTP GET …/event）。
+              log(`提交 prompt…`);
               const promptRes = await api(`/session/${id}/prompt`, {
                 method: "POST",
                 body: JSON.stringify({ prompt: promptPayload }),
+                signal: fetchSignal,
               });
               if (!promptRes.ok) {
                 throw new Error(
@@ -983,59 +1254,111 @@ function createHttpClient(baseURL, auth, directory, log = () => {}, onPermission
               const promptBody = await promptRes.json().catch(() => ({}));
               const promptData = promptBody?.data ?? promptBody;
               const promptMessageId = promptData?.id ?? null;
+              const promptAfterMs = Number(
+                promptData?.timeCreated ?? promptData?.time?.created ?? Date.now()
+              );
               log(
-                `prompt 已提交: messageID=${promptMessageId ?? "?"} seq=${promptData?.admittedSeq ?? "?"} ${preview(JSON.stringify(promptBody))}`
+                `prompt 已提交: messageID=${promptMessageId ?? "?"} seq=${promptData?.admittedSeq ?? "?"} afterMs=${promptAfterMs} ${preview(JSON.stringify(promptBody))}`
               );
 
               log(`连接 SSE: ${apiPrefix}/session/${id}/event`);
-              const eventRes = await api(`/session/${id}/event`, {
-                signal: abortController.signal,
-                headers: { Accept: "text/event-stream" },
-              });
+              let eventRes;
+              try {
+                const sseHeaderTimeout = AbortSignal.timeout(8_000);
+                const sseSignal =
+                  typeof AbortSignal.any === "function"
+                    ? AbortSignal.any([fetchSignal, sseHeaderTimeout])
+                    : fetchSignal;
+                eventRes = await api(`/session/${id}/event`, {
+                  signal: sseSignal,
+                  headers: { Accept: "text/event-stream" },
+                });
+              } catch (err) {
+                if (
+                  fetchSignal.aborted ||
+                  !(
+                    err?.name === "TimeoutError" ||
+                    /aborted|timeout/i.test(String(err?.message ?? err))
+                  )
+                ) {
+                  throw err;
+                }
+                log(
+                  `SSE 响应头超时（8s），改为轮询 /message 兜底 messageID=${promptMessageId ?? "?"}`
+                );
+                return pollSessionMessagesAsEvents({
+                  api,
+                  sessionId: id,
+                  signal: fetchSignal,
+                  log,
+                  messageId: promptMessageId,
+                  afterMs: promptAfterMs,
+                });
+              }
               if (!eventRes.ok) {
                 throw new Error(
                   `事件流失败 (${eventRes.status}): ${await eventRes.text()}`
                 );
               }
-              return parseSessionEventsWithPermissions(
-                eventRes,
-                abortController.signal,
-                log,
-                120_000,
-                {
-                  messageId: promptMessageId,
-                  admittedSeq: promptData?.admittedSeq,
-                },
-                onPermission
-                  ? {
-                      listPermissions: async () => {
-                        const res = await api(`/session/${id}/permission`);
-                        if (!res.ok) return [];
-                        const json = await res.json().catch(() => ({}));
-                        return json?.data ?? json ?? [];
-                      },
-                      replyPermission: async (requestId, reply) => {
-                        const res = await api(
-                          `/session/${id}/permission/${requestId}/reply`,
-                          {
-                            method: "POST",
-                            body: JSON.stringify({ reply }),
-                          }
-                        );
-                        if (!res.ok) {
-                          throw new Error(
-                            `权限回复失败 (${res.status}): ${await res.text()}`
+              log(`SSE 已连通，开始读事件…`);
+
+              // 与 SSE 并行：若 Agent 已跑完但事件丢失，用消息接口补齐（仅接受本次 prompt 之后的回复）
+              return mergeSseWithMessagePoll(
+                parseSessionEventsWithPermissions(
+                  eventRes,
+                  fetchSignal,
+                  log,
+                  120_000,
+                  {
+                    messageId: promptMessageId,
+                    admittedSeq: promptData?.admittedSeq,
+                  },
+                  onPermission
+                    ? {
+                        listPermissions: async () => {
+                          const res = await api(`/session/${id}/permission`, {
+                            signal: fetchSignal,
+                          });
+                          if (!res.ok) return [];
+                          const json = await res.json().catch(() => ({}));
+                          return json?.data ?? json ?? [];
+                        },
+                        replyPermission: async (requestId, reply) => {
+                          const res = await api(
+                            `/session/${id}/permission/${requestId}/reply`,
+                            {
+                              method: "POST",
+                              body: JSON.stringify({ reply }),
+                              signal: fetchSignal,
+                            }
                           );
-                        }
-                      },
-                      onPermission,
-                    }
-                  : null
+                          if (!res.ok) {
+                            throw new Error(
+                              `权限回复失败 (${res.status}): ${await res.text()}`
+                            );
+                          }
+                        },
+                        onPermission,
+                      }
+                    : null
+                ),
+                {
+                  api,
+                  sessionId: id,
+                  signal: fetchSignal,
+                  log,
+                  messageId: promptMessageId,
+                  afterMs: promptAfterMs,
+                }
               );
             };
 
             return {
               async next() {
+                if (fetchSignal.aborted) {
+                  completed = true;
+                  return { done: true, value: undefined };
+                }
                 if (!started) {
                   generator = await start();
                   started = true;

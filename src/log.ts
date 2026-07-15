@@ -1,5 +1,6 @@
-// 诊断日志：默认关闭。开启方式：设置 opencodeBridge.debug = true
-// 或命令面板 → HxxCode: 打开诊断日志
+// 诊断日志：写入「HxxCode 诊断」输出通道
+// 详细调试：设置 opencodeBridge.debug = true
+// 打开通道：命令面板 → HxxCode: 打开诊断日志
 
 import * as vscode from "vscode";
 
@@ -26,14 +27,15 @@ export function initLogging(context: vscode.ExtensionContext): void {
       }
     })
   );
+  context.subscriptions.push(channel());
 }
 
 export function isDebugEnabled(): boolean {
   return _debugEnabled;
 }
 
-export function showDiag(): void {
-  channel().show();
+export function showDiag(preserveFocus = true): void {
+  channel().show(preserveFocus);
 }
 
 function formatLine(args: unknown[]): string {
@@ -51,12 +53,17 @@ function formatLine(args: unknown[]): string {
   return `[${ts}] ${msg}`;
 }
 
-/** 调试日志，仅在 opencodeBridge.debug 开启时输出 */
-export function log(...args: unknown[]): void {
-  if (!_debugEnabled) return;
+/** 始终写入诊断输出（流程关键步骤用这个） */
+export function logInfo(...args: unknown[]): void {
   const line = formatLine(args);
   channel().appendLine(line);
   console.log("[HxxCode]", ...args);
+}
+
+/** 调试日志，仅在 opencodeBridge.debug 开启时输出 */
+export function log(...args: unknown[]): void {
+  if (!_debugEnabled) return;
+  logInfo(...args);
 }
 
 /** 错误日志，始终输出 */

@@ -1,10 +1,11 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
-import { OpencodeManager, StreamEvent, formatErrorMessage, type PromptAttachments } from "./opencodeManager";
+import { OpencodeManager, StreamEvent, formatErrorMessage, isImageUnsupportedError, type PromptAttachments } from "./opencodeManager";
+import { modelSupportsVision } from "./providerStore";
 import type { PermissionReply, PermissionRequest } from "@opencode-ai/sdk";
 import { ProviderStore, ProviderConfig } from "./providerStore";
-import { logError, log } from "./log";
+import { logError, logInfo, showDiag } from "./log";
 import {
   ensureDirs,
   getSessionPath,
@@ -46,6 +47,8 @@ interface SessionMeta {
   createdAt: number;
   messageCount: number;
   lastPreview: string;
+  /** OpenCode 后端会话是否曾发送过图片（纯文本模型需重置后端会话） */
+  backendMayContainImages?: boolean;
 }
 
 /** 发往前端的会话列表项 */
@@ -429,6 +432,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               const loadedMsgs = await this.loadMessagesForSession(newId);
               if (loadedMsgs && loadedMsgs.length > 0) {
                 session.messages = loadedMsgs;
+                this.syncImageBackendFlags(session);
               }
             }
             this.postState();
@@ -825,11 +829,59 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // ── 发送消息 ──────────────────────────────────────────────────────────────
 
+  private sessionHasImageMessages(session: SessionData): boolean {
+    return session.messages.some(
+      (m) => m.role === "user" && m.attachments?.some((a) => a.kind === "image")
+    );
+  }
+
+  private syncImageBackendFlags(session: SessionData): void {
+    if (this.sessionHasImageMessages(session)) {
+      session.info.backendMayContainImages = true;
+    }
+  }
+
+  private async resolveBackendSessionId(
+    session: SessionData,
+    supportsVision: boolean
+  ): Promise<string> {
+    const manager = this.requireOpencodeManager();
+    this.syncImageBackendFlags(session);
+
+    if (session.info.backendMayContainImages && !supportsVision) {
+      const fresh = await manager.createSession(session.info.title);
+      const oldId = session.info.id;
+      session.info.id = fresh.id;
+      session.info.backendMayContainImages = false;
+      if (this.activeSessionId === oldId) {
+        this.activeSessionId = fresh.id;
+      }
+      return fresh.id;
+    }
+
+    const backendId = await manager.ensureBackendSession(
+      session.info.id,
+      session.info.title
+    );
+    if (backendId !== session.info.id) {
+      const oldId = session.info.id;
+      session.info.id = backendId;
+      if (this.activeSessionId === oldId) {
+        this.activeSessionId = backendId;
+      }
+    }
+    return backendId;
+  }
+
   private async handleSendMessage(
     text: string,
     incomingAttachments?: IncomingAttachment[]
   ): Promise<void> {
+    showDiag(true);
+    logInfo("[flow/chat] ========== 发送消息 ==========");
+
     if (!(await this.ensureInitialized())) {
+      logInfo("[flow/chat] 未就绪，中止");
       this.postError("HxxCode 尚未就绪，请稍后重试");
       return;
     }
@@ -839,6 +891,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.createLocalSession();
       session = this.getActiveSession();
       if (!session) {
+        logInfo("[flow/chat] 无会话，中止");
         return;
       }
     }
@@ -848,25 +901,55 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    this.abortController = new AbortController();
+    const requestAbort = new AbortController();
+    this.abortController = requestAbort;
+
+    const providerStore = this.getProviderStore();
+    const { provider, model } = providerStore?.getActive() ?? {};
+    const supportsVision =
+      provider && model ? modelSupportsVision(provider, model) : true;
+
+    logInfo("[flow/chat] 会话/模型", {
+      sessionId: session.info.id,
+      provider: provider?.id,
+      model,
+      supportsVision,
+      textLen: trimmed.length,
+      attachments: (incomingAttachments ?? []).map((a) => ({
+        kind: a.kind,
+        name: a.name,
+        mime: a.mime,
+      })),
+    });
+
+    let attachmentsToSave = incomingAttachments;
+    if (!supportsVision && incomingAttachments?.some((a) => a.kind === "image")) {
+      logInfo("[flow/chat] 模型不支持图片，已剥离 image 附件");
+      this.postError(
+        "当前模型不支持图片，已忽略本次图片附件。请改用支持 Vision 的模型，或新建会话。"
+      );
+      attachmentsToSave = incomingAttachments.filter((a) => a.kind !== "image");
+    }
 
     try {
-      const backendId = await this.requireOpencodeManager().ensureBackendSession(
-        session.info.id,
-        session.info.title
-      );
-      if (backendId !== session.info.id) {
-        const oldId = session.info.id;
-        session.info.id = backendId;
-        if (this.activeSessionId === oldId) {
-          this.activeSessionId = backendId;
-        }
+      logInfo("[flow/chat] 1. resolveBackendSessionId …");
+      const backendId = await this.resolveBackendSessionId(session, supportsVision);
+      logInfo("[flow/chat] 1. 完成 backendId=", backendId);
+      if (requestAbort.signal.aborted) {
+        logInfo("[flow/chat] 已取消 (resolve 后)");
+        return;
       }
 
+      logInfo("[flow/chat] 2. 持久化附件 …");
       const savedAttachments = await this.persistIncomingAttachments(
         backendId,
-        incomingAttachments
+        attachmentsToSave
       );
+      logInfo("[flow/chat] 2. 完成 attachments=", savedAttachments.length);
+      if (requestAbort.signal.aborted) {
+        logInfo("[flow/chat] 已取消 (附件后)");
+        return;
+      }
 
       // 追加用户消息
       session.messages.push({
@@ -898,29 +981,63 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           titleBase.slice(0, 40) + (titleBase.length > 40 ? "…" : "");
       }
 
-      const promptAttachments = await this.toPromptAttachments(savedAttachments);
+      logInfo("[flow/chat] 3. toPromptAttachments …");
+      const promptAttachments = await this.toPromptAttachments(
+        savedAttachments,
+        supportsVision
+      );
+      logInfo("[flow/chat] 3. 完成", {
+        images: promptAttachments?.images?.length ?? 0,
+        texts: promptAttachments?.texts?.length ?? 0,
+      });
+      if (promptAttachments?.images?.length) {
+        session.info.backendMayContainImages = true;
+      }
 
+      logInfo("[flow/chat] 4. promptStream 开始 …");
       await this.requireOpencodeManager().promptStream(
         backendId,
         trimmed,
         (event) => {
+          // 已点停止后忽略迟到的流事件，避免 UI 又回到“生成中”
+          if (requestAbort.signal.aborted) return;
+          if (this.abortController !== requestAbort) return;
+          if (event.type === "text") {
+            logInfo("[flow/chat] ← text delta len=", event.text?.length ?? 0);
+          } else if (event.type === "tool_use") {
+            logInfo("[flow/chat] ← tool_use", event.toolName, event.toolCallId);
+          } else if (event.type === "tool_result") {
+            logInfo("[flow/chat] ← tool_result", event.toolName, event.toolCallId);
+          } else if (event.type === "error") {
+            logInfo("[flow/chat] ← error", event.error);
+          } else if (event.type === "finish") {
+            logInfo("[flow/chat] ← finish");
+          }
           this.handleStreamEvent(session!.info.id, event);
         },
-        this.abortController.signal,
+        requestAbort.signal,
         promptAttachments
       );
+      logInfo("[flow/chat] 4. promptStream 返回");
     } catch (err) {
       const msg = formatErrorMessage(err);
+      logInfo("[flow/chat] ✗ 异常", msg);
       const last = session.messages[session.messages.length - 1];
       const assistantMsg =
         last?.role === "assistant" ? last : null;
       if (
+        requestAbort.signal.aborted ||
         msg.includes("aborted") ||
         msg.includes("cancel") ||
         msg.includes("terminated")
       ) {
-        if (assistantMsg) assistantMsg.text += "\n\n*已取消*";
+        if (assistantMsg && !assistantMsg.text.includes("*已取消*")) {
+          assistantMsg.text += (assistantMsg.text ? "\n\n" : "") + "*已取消*";
+        }
       } else {
+        if (isImageUnsupportedError(msg)) {
+          session.info.backendMayContainImages = true;
+        }
         this.postError(msg);
         if (assistantMsg) {
           assistantMsg.text += `\n\n**错误**: ${msg}`;
@@ -936,9 +1053,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } finally {
       const last = session.messages[session.messages.length - 1];
       if (last?.role === "assistant") last.isStreaming = false;
-      this.abortController = null;
+      if (this.abortController === requestAbort) {
+        this.abortController = null;
+      }
       session.info.messageCount = session.messages.length;
       session.info.lastPreview = lastMessagePreview(session.messages);
+      logInfo("[flow/chat] ========== 发送结束 ==========");
       this.postState();
       this.saveSessionsToDisk();
     }
@@ -1005,7 +1125,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async toPromptAttachments(
-    attachments: Attachment[]
+    attachments: Attachment[],
+    supportsVision = true
   ): Promise<PromptAttachments | undefined> {
     if (!attachments.length) return undefined;
     const images: PromptAttachments["images"] = [];
@@ -1013,6 +1134,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     for (const a of attachments) {
       if (a.kind === "image") {
+        if (!supportsVision) continue;
         images!.push({
           mime: a.mime,
           name: a.name,
@@ -1106,6 +1228,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "error":
         if (event.error) {
           const errText = formatErrorMessage(event.error);
+          if (isImageUnsupportedError(errText)) {
+            session.info.backendMayContainImages = true;
+          }
           lastMsg.text += `\n\n**错误**: ${errText}`;
           this.postError(errText);
         }
@@ -1120,7 +1245,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // ── 取消 / 重试 ───────────────────────────────────────────────────────────
 
   private cancelResponse(): void {
-    this.abortController?.abort();
+    const ac = this.abortController;
+    if (!ac) {
+      logInfo("[flow/chat] 停止：当前没有进行中的请求");
+      return;
+    }
+
+    logInfo("[flow/chat] 用户点击停止 → abort");
+    // 立刻解锁输入框/停止按钮（不必等后端 SSE 真正断开）
+    this.abortController = null;
+    const session = this.getActiveSession();
+    if (session) {
+      const last = session.messages[session.messages.length - 1];
+      if (last?.role === "assistant") {
+        last.isStreaming = false;
+        for (const tc of last.toolCalls) tc.isRunning = false;
+        if (!last.text.includes("*已取消*")) {
+          last.text += (last.text ? "\n\n" : "") + "*已取消*";
+        }
+      }
+      session.info.messageCount = session.messages.length;
+      session.info.lastPreview = lastMessagePreview(session.messages);
+    }
+    this.postState();
+
+    // 再中断 SDK 的 HTTP/SSE（卡在「无输出」时也能解开）
+    try {
+      ac.abort();
+      logInfo("[flow/chat] abort() 已调用");
+    } catch (err) {
+      logInfo("[flow/chat] abort() 异常", String(err));
+    }
   }
 
   private async retryLastMessage(): Promise<void> {
