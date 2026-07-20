@@ -1,14 +1,12 @@
 import * as vscode from "vscode";
 import * as fs from "fs/promises";
+import * as path from "path";
 import type { OpencodeClient, PermissionReply, PermissionRequest } from "@opencode-ai/sdk";
 import { ProviderStore, buildOpencodeProviderConfig, envVarName } from "./providerStore";
-import { logError, logInfo, showDiag } from "./log";
+import { log, logAlways, logError, logInfo } from "./log";
 import { getOpencodeConfigPath, ensureOpencodeDirs, readJSON } from "./storage";
 
 // ── Stream event types ───────────────────────────────────────────────────────
-const TERMINAL_CHUNK_TYPES = new Set([
-  "session.next.step.failed",
-]);
 export type StreamEventType =
   | "text"          // AI 生成了一段文本增量
   | "tool_use"      // AI 请求调用工具（开始执行）
@@ -161,6 +159,8 @@ export class OpencodeManager implements vscode.Disposable {
   private permissionHandler:
     | ((request: PermissionRequest) => Promise<PermissionReply>)
     | null = null;
+  /** 本进程内用户点过「始终允许」的路径前缀，避免服务端未记住时反复弹窗/假成功卡住 */
+  private rememberedAllowPrefixes: string[] = [];
   /** 当前 step 是否已收到 text.delta（避免 text.ended 全量再追加一次） */
   private sawTextDeltaInStep = false;
   /** 本次 prompt 开始时间，恢复时只接受此之后的 assistant */
@@ -188,7 +188,15 @@ export class OpencodeManager implements vscode.Disposable {
       detail !== undefined
         ? `${step} ${typeof detail === "string" ? detail : JSON.stringify(detail)}`
         : step;
-    // 流程日志始终打到「HxxCode 诊断」，方便排查卡住
+    // 关键节点始终可见；高频 chunk 细节走 debug
+    if (/chunk #|等待中|后续 chunk/.test(step)) {
+      log("[flow]", msg);
+      return;
+    }
+    if (/permission|cancel|wait|prompt|错误|失败/i.test(step)) {
+      logAlways("[flow]", msg);
+      return;
+    }
     logInfo("[flow]", msg);
   }
 
@@ -205,9 +213,6 @@ export class OpencodeManager implements vscode.Disposable {
     this.flow("buildEnv", { keys: envKeys, hasKeys: envKeys.length > 0 });
 
     const { createOpencode } = await import("@opencode-ai/sdk");
-    // SDK / stderr 步骤日志始终写入诊断通道
-    const sdkLog = (msg: string) => logInfo("[opencode/sdk]", msg);
-    const sdkStderr = (text: string) => logInfo("[opencode/stderr]", text.trimEnd());
     this.server = await createOpencode({
       config: { cwd: this.workspaceRoot },
       env,
@@ -215,9 +220,27 @@ export class OpencodeManager implements vscode.Disposable {
       cliPackage: agentBackend.npmPackage,
       restartService: this.forceServiceRestart,
       timeout: process.platform === "win32" ? 90_000 : 45_000,
-      onStderr: sdkStderr,
-      onLog: sdkLog,
       onPermission: (request) => this.handlePermissionRequest(request),
+      onLog: (msg) => {
+        const text = String(msg ?? "");
+        // 空权限轮询 / wait 不可用：正常降级路径，勿刷诊断通道
+        if (
+          /GET .*\/permission.*→\s*200/i.test(text) ||
+          /wait 不可用|WAIT_UNAVAILABLE|Session wait is not available/i.test(text)
+        ) {
+          log("[opencode/sdk]", text);
+          return;
+        }
+        if (
+          /权限待确认|permission ask|pending=|prompt 已|完成确认|错误|失败|取消|轮询命中/i.test(
+            text
+          )
+        ) {
+          logAlways("[opencode/sdk]", text);
+        } else {
+          log("[opencode/sdk]", text);
+        }
+      },
     });
     this.client = this.server.client;
 
@@ -339,54 +362,46 @@ export class OpencodeManager implements vscode.Disposable {
   }
 
   /**
-   * 流式发送 prompt：通过 OpenCode Server 发送消息，接收流式事件
-   * （文本增量、工具调用、工具结果），转化为 StreamEvent 回调，
-   * 由调用方（chatViewProvider）转发给 Webview 渲染。
-   * 支持 AbortSignal 取消。
+   * OpencodeExecutor 核心（设计 §7）：
+   * 受理 prompt → 定时查 /message 完成态 → POST /wait 双保险。
+   * SSE 仅进度；超时且 wait 未确认则抛错（task failed）。
    */
-  async promptStream(
-    sessionId: string,
-    text: string,
-    onEvent: (event: StreamEvent) => void,
-    signal?: AbortSignal,
-    attachments?: PromptAttachments
-  ): Promise<void> {
-    const t0 = Date.now();
+  async runAgentTurn(opts: {
+    sessionId: string;
+    text: string;
+    attachments?: PromptAttachments;
+    signal?: AbortSignal;
+    onEvent: (event: StreamEvent) => void;
+    completionPollIntervalMs?: number;
+    completionTimeoutMs?: number;
+    waitTimeoutMs?: number;
+  }): Promise<void> {
     const client = await this.ensureClient();
     const { provider, model } = this.providerStore.getActive();
     if (!provider || !model) {
       throw new Error("尚未配置可用的模型供应商，请先在设置面板中添加");
     }
 
-    const parts = await this.buildPromptParts(text, attachments);
-    const textLen = parts.find((p) => p.type === "text")?.text?.length ?? 0;
-    const fileCount = parts.filter((p) => p.type === "file").length;
-
+    const parts = await this.buildPromptParts(opts.text, opts.attachments);
     this.lastPromptStartedAt = Date.now();
     this.sawTextDeltaInStep = false;
-    this.flow("promptStream 开始", {
-      sessionId,
-      model: `${provider.id}/${model}`,
-      textLen,
-      fileCount,
-      promptStartedAt: this.lastPromptStartedAt,
-    });
-    showDiag(true);
 
-    if (signal?.aborted) {
-      this.flow("promptStream 已取消 (发送前)");
-      return;
+    if (opts.signal?.aborted) {
+      throw new DOMException("The operation was aborted", "AbortError");
     }
 
-    this.flow("promptStream 调用 session.prompt（先提交 prompt，再连 SSE）");
+    const pollMs = opts.completionPollIntervalMs ?? 1_000;
+    const timeoutMs = opts.completionTimeoutMs ?? opts.waitTimeoutMs ?? 600_000;
 
     const result = client.session.prompt({
-      path: { id: sessionId },
+      path: { id: opts.sessionId },
       body: {
         model: `${provider.id}/${model}`,
         parts,
       },
-      signal,
+      signal: opts.signal,
+      completionPollIntervalMs: pollMs,
+      completionTimeoutMs: timeoutMs,
     });
 
     const iterable = result as AsyncIterable<Record<string, unknown>>;
@@ -397,108 +412,125 @@ export class OpencodeManager implements vscode.Disposable {
         : null;
 
     let finished = false;
-    let chunkCount = 0;
-    let gotText = false;
     const onAbort = () => {
       void iterator?.return?.();
     };
-    signal?.addEventListener("abort", onAbort, { once: true });
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
 
     const emit = (event: StreamEvent) => {
       if (event.type === "finish") finished = true;
-      if (event.type === "text" && event.text) gotText = true;
-      onEvent(event);
+      opts.onEvent(event);
     };
 
     try {
       if (!iterator) {
         for await (const chunk of iterable) {
-          chunkCount++;
-          if (signal?.aborted) break;
-          this.handlePromptChunk(chunk, chunkCount, emit);
+          if (opts.signal?.aborted) break;
+          this.handlePromptChunk(chunk, emit);
         }
       } else {
         while (true) {
-          if (signal?.aborted) {
-            this.flow("promptStream 已取消", { chunks: chunkCount });
+          if (opts.signal?.aborted) {
             await iterator.return?.();
             break;
           }
           const next = await iterator.next();
           if (next.done) break;
-          chunkCount++;
-          this.handlePromptChunk(next.value, chunkCount, emit);
+          this.handlePromptChunk(next.value, emit);
         }
       }
 
-      // SSE/生成器结束后仍无正文：再捞一次（复杂识图常见）
-      if (!gotText && !finished && !signal?.aborted) {
-        this.flow("promptStream 结束后无正文，尝试延迟恢复…");
-        const recovered = await this.tryRecoverAssistantTextWithWait(
-          sessionId,
-          signal,
-          90_000
+      if (opts.signal?.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+      // 设计：完成只能来自 message/wait；若生成器结束仍无 finish，视为失败
+      if (!finished) {
+        throw new Error(
+          "Agent 回合结束但未确认完成态（message/wait）。请重启 HxxCode Server 后新建会话重试。"
         );
-        if (recovered) {
-          this.flow("promptStream 延迟恢复成功", { textLen: recovered.length });
-          emit({ type: "text", text: recovered });
-          emit({ type: "finish" });
-        } else {
-          this.flow("promptStream 延迟恢复仍无正文");
-          emit({
-            type: "error",
-            error:
-              "模型未返回正文（复杂识图时 SSE 可能提前断开）。请新建会话重试，或换用 glm-4.6v。",
-          });
-          emit({ type: "finish" });
-        }
       }
     } catch (err) {
-      if (finished || signal?.aborted || this.isBenignStreamError(err)) {
-        this.flow("promptStream 结束 (benign)", {
-          chunks: chunkCount,
-          aborted: !!signal?.aborted,
-          ms: Date.now() - t0,
-        });
+      if (opts.signal?.aborted) {
+        throw err instanceof Error
+          ? err
+          : new DOMException("The operation was aborted", "AbortError");
+      }
+      const errMsg = formatErrorMessage(err);
+      if (finished) {
         return;
       }
-
-      const errMsg = formatErrorMessage(err);
-      if (isAgentStartTimeoutError(errMsg) && !signal?.aborted) {
-        const recovered = await this.tryRecoverAssistantTextWithWait(
-          sessionId,
-          signal,
-          60_000
-        );
-        if (recovered) {
-          this.flow("promptStream SSE 超时但已从消息接口恢复结果", {
-            textLen: recovered.length,
-            ms: Date.now() - t0,
-          });
-          emit({ type: "text", text: recovered });
-          emit({ type: "finish" });
-          return;
-        }
-      }
-
-      this.flow("promptStream 错误", {
-        err: errMsg,
-        chunks: chunkCount,
-        ms: Date.now() - t0,
-      });
       emit({ type: "error", error: errMsg });
-      return;
+      throw err instanceof Error ? err : new Error(errMsg);
     } finally {
-      signal?.removeEventListener("abort", onAbort);
+      opts.signal?.removeEventListener("abort", onAbort);
     }
-    if (!signal?.aborted && !finished) emit({ type: "finish" });
-    this.flow("promptStream 完成", {
-      chunks: chunkCount,
-      finished,
-      gotText,
-      aborted: !!signal?.aborted,
-      ms: Date.now() - t0,
-    });
+  }
+
+  /**
+   * 取消双保险：确认远端 agent loop 已 idle，或本轮 assistant 已最终完成。
+   * 供 ConversationManager / LildaxRuntime 取消确认使用。
+   */
+  async confirmSessionIdle(
+    sessionId: string,
+    signal?: AbortSignal,
+    timeoutMs = 20_000
+  ): Promise<boolean> {
+    const client = await this.ensureClient();
+    const deadline = Date.now() + Math.max(1_000, timeoutMs);
+
+    // 1) wait（短超时）；503/404 视为不可用，立刻走轮询
+    if (client.session.wait) {
+      try {
+        await client.session.wait(sessionId, {
+          signal,
+          timeoutMs: Math.min(5_000, timeoutMs),
+        });
+        return true;
+      } catch (err) {
+        if (signal?.aborted) return false;
+        this.flow("confirmSessionIdle wait 未确认", formatErrorMessage(err));
+      }
+    }
+
+    // 2) 轮询 message，直到确认本轮最终结束或超时
+    while (!signal?.aborted && Date.now() < deadline) {
+      try {
+        if (!client.session.listMessages) break;
+        const res = await client.session.listMessages(sessionId);
+        const messages = res.data ?? [];
+        const afterMs = this.lastPromptStartedAt || 0;
+        let latest: (typeof messages)[number] | null = null;
+        for (const msg of messages) {
+          if (msg?.type !== "assistant") continue;
+          const created = Number(msg.time?.created ?? 0);
+          if (afterMs && created && created < afterMs) continue;
+          if (!latest || created >= Number(latest.time?.created ?? 0)) {
+            latest = msg;
+          }
+        }
+        if (latest) {
+          const finish = (latest as { finish?: string }).finish ?? null;
+          // 中间态 tool-calls 不算已停
+          if (finish !== "tool-calls" && finish !== "tool_calls") {
+            if (
+              latest.time?.completed ||
+              finish === "stop" ||
+              finish === "end_turn" ||
+              finish === "cancelled" ||
+              finish === "canceled" ||
+              finish === "error"
+            ) {
+              return true;
+            }
+          }
+        }
+      } catch {
+        // ignore one poll error
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+
+    return false;
   }
 
   /** SSE 丢事件时，只捞「本次 prompt 之后」完成的 assistant 文本 */
@@ -520,16 +552,11 @@ export class OpencodeManager implements vscode.Disposable {
           .map((c) => c.text as string);
         const text = texts.join("\n").trim();
         if (text) {
-          this.flow("tryRecoverAssistantText 命中本次回复", {
-            messageId: msg.id,
-            created,
-            textLen: text.length,
-          });
           return text;
         }
       }
-    } catch (err) {
-      this.flow("tryRecoverAssistantText 失败", formatErrorMessage(err));
+    } catch {
+      // 忽略恢复失败
     }
     return null;
   }
@@ -541,15 +568,9 @@ export class OpencodeManager implements vscode.Disposable {
     timeoutMs: number
   ): Promise<string | null> {
     const t0 = Date.now();
-    let attempt = 0;
     while (!signal?.aborted && Date.now() - t0 < timeoutMs) {
-      attempt++;
       const text = await this.tryRecoverAssistantText(sessionId);
       if (text) return text;
-      this.flow("tryRecoverAssistantTextWithWait 等待中", {
-        attempt,
-        elapsedMs: Date.now() - t0,
-      });
       await new Promise((r) => setTimeout(r, 2000));
     }
     return null;
@@ -557,15 +578,8 @@ export class OpencodeManager implements vscode.Disposable {
 
   private handlePromptChunk(
     chunk: Record<string, unknown>,
-    chunkCount: number,
     onEvent: (event: StreamEvent) => void
   ): void {
-    const chunkType = chunk.type;
-    if (chunkCount <= 20 || TERMINAL_CHUNK_TYPES.has(String(chunkType))) {
-      this.flow(`promptStream chunk #${chunkCount}`, chunkType);
-    } else if (chunkCount === 21) {
-      this.flow("promptStream …后续 chunk 省略");
-    }
     this.interpretChunk(chunk, onEvent);
   }
 
@@ -620,9 +634,38 @@ export class OpencodeManager implements vscode.Disposable {
   private async handlePermissionRequest(
     request: PermissionRequest
   ): Promise<PermissionReply> {
+    // 工作区内部低风险读写可自动批准；外部目录/bash 等必须弹 UI
+    if (this.isWorkspaceLocalPermission(request)) {
+      logAlways("[permission] auto-approve (workspace)", {
+        action: request.action,
+        resources: request.resources,
+      });
+      return "always";
+    }
+
+    if (this.isRememberedAllow(request)) {
+      logAlways("[permission] auto-approve (remembered)", {
+        action: request.action,
+        resources: request.resources,
+      });
+      return "always";
+    }
+
+    logAlways("[permission] ask user", {
+      action: request.action,
+      resources: request.resources,
+      id: request.id,
+    });
+
     if (this.permissionHandler) {
       const reply = await this.permissionHandler(request);
-      this.flow("permission", { action: request.action, resources: request.resources, reply });
+      logAlways("[permission] user reply", {
+        action: request.action,
+        reply,
+      });
+      if (reply === "always") {
+        this.rememberAllow(request);
+      }
       return reply;
     }
 
@@ -646,7 +689,83 @@ export class OpencodeManager implements vscode.Disposable {
     );
     const reply = choice?.value ?? "reject";
     this.flow("permission", { action, resources: request.resources, reply });
+    if (reply === "always") {
+      this.rememberAllow(request);
+    }
     return reply;
+  }
+
+  private rememberAllow(request: PermissionRequest): void {
+    for (const raw of request.resources ?? []) {
+      const p = this.resolvePermissionResourcePath(String(raw));
+      if (!p) continue;
+      if (!this.rememberedAllowPrefixes.includes(p)) {
+        this.rememberedAllowPrefixes.push(p);
+      }
+    }
+  }
+
+  private isRememberedAllow(request: PermissionRequest): boolean {
+    const resources = request.resources ?? [];
+    if (!resources.length || !this.rememberedAllowPrefixes.length) return false;
+    return resources.every((raw) => {
+      const p = this.resolvePermissionResourcePath(String(raw));
+      if (!p) return false;
+      return this.rememberedAllowPrefixes.some(
+        (prefix) => p === prefix || p.startsWith(prefix + "/") || prefix.startsWith(p + "/")
+      );
+    });
+  }
+
+  /**
+   * 仅「当前工作区内」的低风险文件读写可自动批准。
+   * 工作区外目录 / bash / 网络等一律弹授权栏（否则用户看不到确认 UI）。
+   */
+  private isWorkspaceLocalPermission(request: PermissionRequest): boolean {
+    const action = String(request.action ?? "").toLowerCase();
+    if (
+      action === "bash" ||
+      action === "shell" ||
+      action === "external_directory" ||
+      action === "webfetch" ||
+      action === "websearch" ||
+      action === "doom_loop"
+    ) {
+      return false;
+    }
+    const resources = request.resources ?? [];
+    if (!resources.length || !this.workspaceRoot) return false;
+    const root = this.normalizeFsPath(this.workspaceRoot);
+    return resources.every((raw) => {
+      const p = this.resolvePermissionResourcePath(String(raw));
+      if (!p) return false;
+      return p === root || p.startsWith(root + "/");
+    });
+  }
+
+  /** 把权限资源解析成绝对路径（相对路径按工作区根拼接） */
+  private resolvePermissionResourcePath(raw: string): string | null {
+    let s = String(raw || "").trim();
+    if (!s) return null;
+    // external_directory 常见：D:/foo/* 或 /foo/*
+    s = s.replace(/\/\*$/, "").replace(/\*$/, "").replace(/\/$/, "");
+    if (s.startsWith("file:")) {
+      try {
+        s = vscode.Uri.parse(s).fsPath;
+      } catch {
+        s = s.replace(/^file:\/\//, "");
+      }
+    }
+    const looksAbsolute =
+      path.isAbsolute(s) ||
+      /^[a-zA-Z]:[\\/]/.test(s) ||
+      s.startsWith("\\\\");
+    const abs = looksAbsolute ? s : path.join(this.workspaceRoot, s);
+    return this.normalizeFsPath(abs);
+  }
+
+  private normalizeFsPath(p: string): string {
+    return p.replace(/\\/g, "/").replace(/^[a-zA-Z]:/, (m) => m.toUpperCase()).toLowerCase();
   }
 
   private isBenignStreamError(err: unknown): boolean {

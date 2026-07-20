@@ -53,8 +53,16 @@ function formatLine(args: unknown[]): string {
   return `[${ts}] ${msg}`;
 }
 
-/** 始终写入诊断输出（流程关键步骤用这个） */
+/** 流程日志，仅在 opencodeBridge.debug 开启时输出（正常使用不打印，避免刷屏） */
 export function logInfo(...args: unknown[]): void {
+  if (!_debugEnabled) return;
+  const line = formatLine(args);
+  channel().appendLine(line);
+  console.log("[HxxCode]", ...args);
+}
+
+/** 关键节点始终写入诊断通道（权限/取消等，便于排查卡住） */
+export function logAlways(...args: unknown[]): void {
   const line = formatLine(args);
   channel().appendLine(line);
   console.log("[HxxCode]", ...args);

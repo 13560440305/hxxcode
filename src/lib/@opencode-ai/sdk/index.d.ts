@@ -41,6 +41,10 @@ export interface PromptOptions {
   body: SessionPromptBody;
   /** 取消时中断 SSE / 进行中的 HTTP 请求 */
   signal?: AbortSignal;
+  /** 消息完成态轮询间隔（毫秒） */
+  completionPollIntervalMs?: number;
+  /** 单任务最长等待（毫秒） */
+  completionTimeoutMs?: number;
 }
 
 export interface SessionClient {
@@ -56,6 +60,11 @@ export interface SessionClient {
       time?: { created?: number; completed?: number };
     }>;
   }>;
+  /** 等待 session agent loop idle（POST /wait） */
+  wait?(
+    sessionId: string,
+    options?: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<{ idle: true }>;
   prompt(options: PromptOptions): AsyncIterable<StreamChunk>;
   switchModel?(sessionId: string, modelRef: { providerID: string; id: string }): Promise<void>;
 }

@@ -19,7 +19,10 @@ export interface ProviderConfig {
   baseURL: string;
   /** 自定义 npm 包名，仅 kind === "custom" 时使用 */
   npm?: string;
+  /** 对话 / 编程 Agent 模型 */
   models: string[];
+  /** 识图 Vision 模型（与 models 分类存放） */
+  visionModels?: string[];
   isDefault?: boolean;
 }
 
@@ -27,6 +30,10 @@ interface ProviderState {
   providers: ProviderConfig[];
   activeProviderId: string | null;
   activeModel: string | null;
+  /** 当前识图模型（通常属于 activeProvider，也可跨供应商） */
+  activeVisionModel: string | null;
+  /** 识图模型所属供应商；缺省时跟 activeProviderId */
+  activeVisionProviderId: string | null;
   /** API Key 按 provider.id 存储 */
   apiKeys: Record<string, string>;
   /** Agent CLI 后端（默认 @opencode-ai/cli） */
@@ -41,6 +48,8 @@ const DEFAULT_STATE: ProviderState = {
   providers: [],
   activeProviderId: null,
   activeModel: null,
+  activeVisionModel: null,
+  activeVisionProviderId: null,
   apiKeys: {},
   agentBackend: defaultAgentBackendSettings(),
 };
@@ -73,12 +82,18 @@ export class ProviderStore {
         providers: deduped,
         agentBackend: normalizeAgentBackendSettings(fileState.agentBackend),
       };
+      this.ensureActiveVisionDefaults();
       if (deduped.length !== fileState.providers.length) {
         await this.persist();
       } else {
         const before = JSON.stringify(fileState.providers);
         const after = JSON.stringify(deduped);
-        if (before !== after) {
+        if (
+          before !== after ||
+          this.state.activeVisionModel !== fileState.activeVisionModel ||
+          this.state.activeVisionProviderId !==
+            (fileState as ProviderState).activeVisionProviderId
+        ) {
           await this.persist();
         }
       }
@@ -98,9 +113,12 @@ export class ProviderStore {
         providers: dedupeProviders(oldState.providers),
         activeProviderId: oldState.activeProviderId,
         activeModel: oldState.activeModel,
+        activeVisionModel: oldState.activeVisionModel ?? null,
+        activeVisionProviderId: oldState.activeVisionProviderId ?? null,
         apiKeys,
         agentBackend: defaultAgentBackendSettings(),
       };
+      this.ensureActiveVisionDefaults();
       await this.persist();
       // 清理旧数据
       await this.context.globalState.update(STATE_KEY, undefined);
@@ -184,13 +202,79 @@ export class ProviderStore {
     return { provider, model };
   }
 
+  /** 当前识图模型（独立于对话模型） */
+  getActiveVision(): {
+    provider: ProviderConfig | undefined;
+    model: string | null;
+  } {
+    const providerId =
+      this.state.activeVisionProviderId || this.state.activeProviderId;
+    let provider = providerId ? this.get(providerId) : undefined;
+    if (!provider) {
+      provider =
+        this.state.providers.find((p) => (p.visionModels?.length ?? 0) > 0) ??
+        this.getActive().provider;
+    }
+    const visionList = provider?.visionModels ?? [];
+    const model = provider
+      ? resolveCanonicalModel(visionList, this.state.activeVisionModel)
+      : this.state.activeVisionModel;
+    return { provider, model };
+  }
+
   async setActive(providerId: string, model: string): Promise<void> {
     const provider = this.get(providerId);
     this.state.activeProviderId = providerId;
     this.state.activeModel = provider
       ? resolveCanonicalModel(provider.models, model)
       : model;
+    // 同供应商下若还没选识图模型，自动带上默认识图模型
+    if (provider && (provider.visionModels?.length ?? 0) > 0) {
+      const visionOk =
+        this.state.activeVisionProviderId === providerId &&
+        this.state.activeVisionModel &&
+        provider.visionModels!.some(
+          (m) =>
+            m.toLowerCase() ===
+            String(this.state.activeVisionModel).toLowerCase()
+        );
+      if (!visionOk) {
+        this.state.activeVisionProviderId = providerId;
+        this.state.activeVisionModel =
+          resolveCanonicalModel(
+            provider.visionModels!,
+            this.state.activeVisionModel
+          ) ?? provider.visionModels![0];
+      }
+    }
     await this.persist();
+  }
+
+  async setActiveVision(providerId: string, model: string): Promise<void> {
+    const provider = this.get(providerId);
+    this.state.activeVisionProviderId = providerId;
+    this.state.activeVisionModel = provider
+      ? resolveCanonicalModel(provider.visionModels ?? [], model)
+      : model;
+    await this.persist();
+  }
+
+  /** 加载后补齐识图默认值 */
+  private ensureActiveVisionDefaults(): void {
+    this.state.providers = this.state.providers.map(ensureModelCategories);
+    const { provider, model } = this.getActiveVision();
+    if (provider && model) {
+      this.state.activeVisionProviderId = provider.id;
+      this.state.activeVisionModel = model;
+      return;
+    }
+    for (const p of this.state.providers) {
+      if (p.visionModels && p.visionModels.length > 0) {
+        this.state.activeVisionProviderId = p.id;
+        this.state.activeVisionModel = p.visionModels[0];
+        return;
+      }
+    }
   }
 
   async upsertProvider(config: ProviderConfig, apiKey: string): Promise<ProviderConfig> {
@@ -210,6 +294,7 @@ export class ProviderStore {
         ...normalized,
         id: existing.id,
         models: dedupeModels(normalized.models),
+        visionModels: dedupeModels(normalized.visionModels ?? []),
       };
       this.state.providers[idx] = saved;
     } else {
@@ -239,6 +324,22 @@ export class ProviderStore {
       this.state.activeProviderId = saved.id;
       this.state.activeModel = saved.models[0] ?? null;
     }
+    if (
+      this.state.activeVisionProviderId === saved.id ||
+      !this.state.activeVisionModel
+    ) {
+      const v = resolveCanonicalModel(
+        saved.visionModels ?? [],
+        this.state.activeVisionModel
+      );
+      if (v) {
+        this.state.activeVisionProviderId = saved.id;
+        this.state.activeVisionModel = v;
+      } else if ((saved.visionModels?.length ?? 0) > 0) {
+        this.state.activeVisionProviderId = saved.id;
+        this.state.activeVisionModel = saved.visionModels![0];
+      }
+    }
     await this.persist();
     return saved;
   }
@@ -252,6 +353,11 @@ export class ProviderStore {
     if (this.state.activeProviderId === id) {
       this.state.activeProviderId = this.state.providers[0]?.id ?? null;
       this.state.activeModel = this.state.providers[0]?.models[0] ?? null;
+    }
+    if (this.state.activeVisionProviderId === id) {
+      this.state.activeVisionProviderId = null;
+      this.state.activeVisionModel = null;
+      this.ensureActiveVisionDefaults();
     }
     await this.persist();
   }
@@ -286,6 +392,8 @@ export class ProviderStore {
       providers: this.state.providers,
       activeProviderId: this.state.activeProviderId,
       activeModel: this.state.activeModel,
+      activeVisionModel: this.state.activeVisionModel,
+      activeVisionProviderId: this.state.activeVisionProviderId,
       apiKeys: this.state.apiKeys,
       agentBackend: this.state.agentBackend,
     });
@@ -372,12 +480,13 @@ function providerMatchKey(config: Pick<ProviderConfig, "name" | "baseURL">): str
 }
 
 function normalizeProviderConfig(config: ProviderConfig): ProviderConfig {
-  return {
+  return ensureModelCategories({
     ...config,
     name: config.name.trim(),
     baseURL: normalizeBaseURL(config.baseURL.trim()),
     models: dedupeModels(config.models ?? []),
-  };
+    visionModels: dedupeModels(config.visionModels ?? []),
+  });
 }
 
 /** 按名称 + Base URL 合并重复供应商，并去重模型列表 */
@@ -391,14 +500,46 @@ function dedupeProviders(providers: ProviderConfig[]): ProviderConfig[] {
       byKey.set(key, p);
       continue;
     }
-    byKey.set(key, {
+    byKey.set(key, ensureModelCategories({
       ...existing,
       ...p,
       id: existing.id,
       models: dedupeModels([...existing.models, ...p.models]),
-    });
+      visionModels: dedupeModels([
+        ...(existing.visionModels ?? []),
+        ...(p.visionModels ?? []),
+      ]),
+    }));
   }
   return Array.from(byKey.values());
+}
+
+/**
+ * 若尚未分类 visionModels，按模型名启发式拆分。
+ * 已有 visionModels 时尊重用户配置，仅去重。
+ */
+export function ensureModelCategories(config: ProviderConfig): ProviderConfig {
+  let models = dedupeModels(config.models ?? []);
+  let visionModels = dedupeModels(config.visionModels ?? []);
+
+  if (visionModels.length === 0 && models.length > 0) {
+    const autoVision = models.filter((m) => isVisionModelName(m));
+    if (autoVision.length > 0) {
+      visionModels = autoVision;
+      const textOnly = models.filter((m) => !isVisionModelName(m));
+      // 若全是识图模型，对话列表仍保留全部，避免 Agent 无模型可选
+      models = textOnly.length > 0 ? textOnly : [...models];
+    }
+  }
+
+  // 避免同一模型同时占两类时混乱：识图列表优先，从对话列表去掉
+  if (visionModels.length > 0) {
+    const vset = new Set(visionModels.map((m) => m.toLowerCase()));
+    const filtered = models.filter((m) => !vset.has(m.toLowerCase()));
+    if (filtered.length > 0) models = filtered;
+  }
+
+  return { ...config, models, visionModels };
 }
 
 export function buildOpencodeProviderConfig(
@@ -409,6 +550,13 @@ export function buildOpencodeProviderConfig(
   for (const p of providers) {
     if (!p.baseURL) continue;
     const apiKey = apiKeys[p.id] ?? `{env:${envVarName(p.id)}}`;
+    const allModels = dedupeModels([
+      ...(p.models ?? []),
+      ...(p.visionModels ?? []),
+    ]);
+    const visionSet = new Set(
+      (p.visionModels ?? []).map((m) => m.toLowerCase())
+    );
     result[p.id] = {
       npm: npmForKind(p.kind, p.npm),
       name: p.name,
@@ -417,13 +565,14 @@ export function buildOpencodeProviderConfig(
         apiKey,
       },
       models: Object.fromEntries(
-        p.models.map((m) => [
+        allModels.map((m) => [
           m,
           {
             name: m,
-            modalities: modelSupportsVision(p, m)
-              ? { input: ["text", "image"], output: ["text"] }
-              : { input: ["text"], output: ["text"] },
+            modalities:
+              visionSet.has(m.toLowerCase()) || modelSupportsVision(p, m)
+                ? { input: ["text", "image"], output: ["text"] }
+                : { input: ["text"], output: ["text"] },
           },
         ])
       ),
@@ -439,11 +588,12 @@ export function envVarName(providerId: string): string {
 /** 已知仅支持纯文本的 API 域名（官方接口不接受 image_url） */
 const TEXT_ONLY_API_HOSTS = [/deepseek\.com/i, /api\.deepseek/i];
 
-/** 模型名暗示支持 Vision 的常见模式 */
+/** 模型名暗示支持 Vision 的常见模式（默认不支持；勿用过宽规则把 glm-5.2 等文本模型标成多模态） */
 const VISION_MODEL_PATTERNS = [
   /gpt-4o/i,
   /gpt-4-turbo/i,
   /gpt-4-vision/i,
+  /gpt-4\.1/i,
   /gpt-5/i,
   /claude-3/i,
   /claude-sonnet-4/i,
@@ -453,11 +603,20 @@ const VISION_MODEL_PATTERNS = [
   /gemini.*pro/i,
   /glm-4\.6v/i,
   /glm-4v/i,
-  /qwen-vl/i,
+  /glm-5v/i,
+  /qwen[-.]?vl/i,
   /vision/i,
-  /4v\b/i,
-  /\.6v\b/i,
 ];
+
+/** 仅根据模型名判断是否像 Vision（用于分类/拉取） */
+export function isVisionModelName(model: string): boolean {
+  const name = (model || "").trim();
+  if (!name) return false;
+  if (/^glm-\d+(\.\d+)?$/i.test(name)) return false;
+  if (VISION_MODEL_PATTERNS.some((re) => re.test(name))) return true;
+  if (/(?:^|[-_.])vl(?:$|[-_.])|vision|4v|5v|\.6v/i.test(name)) return true;
+  return false;
+}
 
 /** 当前供应商 + 模型是否应向 OpenCode 声明 image 输入能力 */
 export function modelSupportsVision(provider: ProviderConfig, model: string): boolean {
@@ -465,11 +624,8 @@ export function modelSupportsVision(provider: ProviderConfig, model: string): bo
   if (TEXT_ONLY_API_HOSTS.some((re) => re.test(base))) {
     return false;
   }
-  if (VISION_MODEL_PATTERNS.some((re) => re.test(model))) {
+  if ((provider.visionModels ?? []).some((m) => m.toLowerCase() === model.toLowerCase())) {
     return true;
   }
-  if (/vl|vision|4v|\.6v/i.test(model)) {
-    return true;
-  }
-  return true;
+  return isVisionModelName(model);
 }

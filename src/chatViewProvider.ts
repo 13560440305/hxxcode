@@ -1,11 +1,12 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
+import * as fsp from "fs/promises";
 import * as path from "path";
 import { OpencodeManager, StreamEvent, formatErrorMessage, isImageUnsupportedError, type PromptAttachments } from "./opencodeManager";
-import { modelSupportsVision } from "./providerStore";
+import { pickVisionModel } from "./visionRecognize";
 import type { PermissionReply, PermissionRequest } from "@opencode-ai/sdk";
 import { ProviderStore, ProviderConfig } from "./providerStore";
-import { logError, logInfo, showDiag } from "./log";
+import { logAlways, logError } from "./log";
 import {
   ensureDirs,
   getSessionPath,
@@ -20,8 +21,13 @@ import {
   readJSON,
   SessionIndexEntry,
 } from "./storage";
-import * as crypto from "crypto";
-import * as fsp from "fs/promises";
+import { ConversationManager } from "./conversation";
+import type { ConversationEvent } from "./events";
+import {
+  newPartId,
+  type ChatMessage as AgentMessage,
+  type MessagePart,
+} from "./models";
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -68,11 +74,21 @@ interface ToolCallDisplay {
   isRunning: boolean;
 }
 
+/** 可折叠上下文块（识图结果等），落盘可追溯 */
+interface MessageBlock {
+  id: string;
+  kind: "vision" | "note";
+  title: string;
+  body: string;
+}
+
 interface ChatMessage {
   role: "user" | "assistant";
   text: string;
   attachments?: Attachment[];
   toolCalls: ToolCallDisplay[];
+  /** 识图结果等，默认折叠展示 */
+  blocks?: MessageBlock[];
   isStreaming: boolean;
 }
 
@@ -91,8 +107,15 @@ const ARCHIVE_AGE_DAYS = 30;
 function lastMessagePreview(messages: ChatMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
+    const vision = m.blocks?.find((b) => b.kind === "vision" && b.body?.trim());
+    if (vision) {
+      return `[Vision] ${vision.body.trim()}`.slice(0, 80);
+    }
     const t = m.text?.trim();
     if (t) return t.slice(0, 80);
+    if (m.toolCalls?.length) {
+      return `[${m.toolCalls.length} tools]`.slice(0, 80);
+    }
     if (m.attachments?.length) {
       return `[附件] ${m.attachments.map((a) => a.name).join(", ")}`.slice(0, 80);
     }
@@ -126,11 +149,21 @@ type WebviewMessage =
   | { type: "createSession" }
   | { type: "switchSession"; payload: { sessionId: string } }
   | { type: "switchModel"; payload: { providerId: string; model: string } }
+  | { type: "switchVisionModel"; payload: { providerId: string; model: string } }
   | { type: "cancelResponse" }
   | { type: "deleteSession"; payload: { sessionId: string } }
   | { type: "retryLastMessage" }
   | { type: "openSettings" }
-  | { type: "openFile"; payload: { path: string } }
+  | { type: "openFile"; payload: { path: string; line?: number } }
+  | {
+      type: "openDiff";
+      payload: {
+        path: string;
+        oldText?: string;
+        newText?: string;
+        title?: string;
+      };
+    }
   | { type: "requestState" }
   | { type: "permissionReply"; payload: { id: string; reply: PermissionReply } };
 
@@ -226,15 +259,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private bindOpencodeManager(manager: OpencodeManager): void {
     manager.setPermissionHandler((req) => this.requestPermissionInWebview(req));
+    this.rebuildConversationManager(manager);
+  }
+
+  private rebuildConversationManager(manager: OpencodeManager): void {
+    this.eventUnsub?.();
+    this.conversationManager?.dispose();
+    this.conversationManager = new ConversationManager(manager);
+    this.eventUnsub = this.conversationManager.eventBus.on((e) =>
+      this.onConversationEvent(e)
+    );
+  }
+
+  private ensureConversationManager(): ConversationManager {
+    if (!this.conversationManager) {
+      this.rebuildConversationManager(this.requireOpencodeManager());
+    }
+    return this.conversationManager!;
   }
 
   private _view?: vscode.WebviewView;
   private sessions: SessionData[] = [];
   private activeSessionId: string | null = null;
   private abortController: AbortController | null = null;
+  /** Pipeline 业务编排 */
+  private conversationManager: ConversationManager | null = null;
+  private eventUnsub: (() => void) | null = null;
+  /** 当前正在流式的本地会话 id（用于事件路由） */
+  private activeStreamLocalId: string | null = null;
+  /** Claude Code 式活动状态（显示在输入框上方，不写入气泡） */
+  private activityLabel: string | null = null;
   private sessionsLoaded = false;
   private webviewReady = false;
   private pendingPermissionResolve: ((reply: PermissionReply) => void) | null = null;
+  private permissionQueue: Array<{
+    request: PermissionRequest;
+    resolve: (reply: PermissionReply) => void;
+  }> = [];
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -345,7 +406,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         providers: [] as ProviderConfig[],
         activeProviderId: null,
         activeModel: null,
+        activeVisionProviderId: null,
+        activeVisionModel: null,
         isStreaming: false,
+        activity: null as string | null,
       };
     }
 
@@ -359,6 +423,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const session = this.getActiveSession();
     const { provider, model } = providerStore.getActive();
+    const vision = providerStore.getActiveVision();
+    const isStreaming = (session?.messages ?? []).some(
+      (m) => m.role === "assistant" && m.isStreaming
+    );
 
     return {
       sessionList: this.buildSessionListItems(),
@@ -367,7 +435,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       providers: providerStore.list(),
       activeProviderId: provider?.id ?? null,
       activeModel: model,
-      isStreaming: !!this.abortController,
+      activeVisionProviderId: vision.provider?.id ?? null,
+      activeVisionModel: vision.model,
+      // 以消息流式标记为准，避免 cancel 收尾时输入框一直 disabled
+      isStreaming,
+      activity: isStreaming ? this.activityLabel : null,
     };
   }
 
@@ -456,8 +528,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         break;
 
+      case "switchVisionModel":
+        try {
+          const store = this.getProviderStore();
+          if (!store) {
+            this.postError("HxxCode 尚未就绪，请稍后重试");
+            break;
+          }
+          await store.setActiveVision(msg.payload.providerId, msg.payload.model);
+          this.postState();
+        } catch (err) {
+          this.postError(`切换识图模型失败: ${(err as Error).message}`);
+        }
+        break;
+
       case "cancelResponse":
-        this.cancelResponse();
+        void this.cancelResponse();
         break;
 
       case "deleteSession":
@@ -476,11 +562,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const filePath = msg.payload.path?.trim();
         if (filePath) {
           const uri = vscode.Uri.file(filePath);
-          void vscode.window.showTextDocument(uri, {
-            preview: false,
-            viewColumn: vscode.ViewColumn.One,
-          });
+          const line = Math.max(0, (msg.payload.line ?? 1) - 1);
+          void vscode.window
+            .showTextDocument(uri, {
+              preview: false,
+              viewColumn: vscode.ViewColumn.One,
+              selection:
+                msg.payload.line != null
+                  ? new vscode.Range(line, 0, line, 0)
+                  : undefined,
+            })
+            .then(undefined, (err) => {
+              this.postError(`无法打开文件: ${formatErrorMessage(err)}`);
+            });
         }
+        break;
+      }
+
+      case "openDiff": {
+        void this.openToolDiff(msg.payload);
         break;
       }
 
@@ -491,26 +591,170 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "permissionReply":
         if (this.pendingPermissionResolve) {
           this.pendingPermissionResolve(msg.payload.reply);
-          this.pendingPermissionResolve = null;
         }
         break;
     }
   }
 
-  /** OpenCode 工具权限确认 —— 在侧栏 Webview 内展示，而非顶部 QuickPick */
+  /** Cursor 风格：用内置 Diff 编辑器查看工具改动 */
+  private async openToolDiff(payload: {
+    path: string;
+    oldText?: string;
+    newText?: string;
+    title?: string;
+  }): Promise<void> {
+    const filePath = payload.path?.trim();
+    if (!filePath) return;
+
+    try {
+      const rightUri = vscode.Uri.file(filePath);
+      let newText = payload.newText;
+      if (newText == null) {
+        try {
+          newText = await fsp.readFile(filePath, "utf-8");
+        } catch {
+          newText = "";
+        }
+      }
+      const oldText = payload.oldText ?? "";
+      const tmpDir = path.join(getHxxCodeDir(), "diff-tmp");
+      await fsp.mkdir(tmpDir, { recursive: true });
+      const stamp = Date.now().toString(36);
+      const base = path.basename(filePath).replace(/[<>:"/\\|?*]/g, "_");
+      const leftPath = path.join(tmpDir, `${stamp}-before-${base}`);
+      await fsp.writeFile(leftPath, oldText, "utf-8");
+      // 若磁盘文件与 newText 不一致（或文件不存在），用临时右文件
+      let rightForDiff = rightUri;
+      try {
+        const onDisk = await fsp.readFile(filePath, "utf-8");
+        if (onDisk !== newText) {
+          const rightPath = path.join(tmpDir, `${stamp}-after-${base}`);
+          await fsp.writeFile(rightPath, newText, "utf-8");
+          rightForDiff = vscode.Uri.file(rightPath);
+        }
+      } catch {
+        const rightPath = path.join(tmpDir, `${stamp}-after-${base}`);
+        await fsp.writeFile(rightPath, newText, "utf-8");
+        rightForDiff = vscode.Uri.file(rightPath);
+      }
+
+      const title =
+        payload.title || `${path.basename(filePath)} (HxxCode)`;
+      await vscode.commands.executeCommand(
+        "vscode.diff",
+        vscode.Uri.file(leftPath),
+        rightForDiff,
+        title
+      );
+    } catch (err) {
+      this.postError(`无法打开 Diff: ${formatErrorMessage(err)}`);
+    }
+  }
+
+  /** OpenCode 工具权限确认 —— 侧栏面板 + VS Code 通知双通道，避免漏弹 */
   requestPermissionInWebview(request: PermissionRequest): Promise<PermissionReply> {
     return new Promise((resolve) => {
-      this.pendingPermissionResolve = resolve;
-      void this._view?.show?.(true);
-      this.postMessage({
-        type: "permissionRequest",
-        payload: {
-          id: request.id,
-          action: request.action ?? "unknown",
-          resources: request.resources ?? [],
-        },
-      });
+      let settled = false;
+      const settle = (reply: PermissionReply) => {
+        if (settled) return;
+        settled = true;
+        // 任一通道点选后立刻收起 UI，避免一直显示「等待权限确认」
+        if (this.pendingPermissionResolve) {
+          this.pendingPermissionResolve = null;
+        }
+        this.postMessage({ type: "permissionClear" });
+        this.markPermissionResolved(reply);
+        resolve(reply);
+        // 继续处理队列里下一项
+        this.drainPermissionQueue();
+      };
+
+      this.permissionQueue.push({ request, resolve: settle });
+      this.drainPermissionQueue();
+
+      const action = request.action ?? "unknown";
+      const resources = (request.resources ?? []).join(", ") || "unspecified";
+      void vscode.window
+        .showInformationMessage(
+          `HxxCode: ${action} — ${resources}`,
+          "Allow",
+          "Always allow",
+          "Deny"
+        )
+        .then((choice) => {
+          if (choice === "Allow") settle("once");
+          else if (choice === "Always allow") settle("always");
+          else if (choice === "Deny") settle("reject");
+        });
     });
+  }
+
+  private drainPermissionQueue(): void {
+    if (this.pendingPermissionResolve) return;
+    const next = this.permissionQueue.shift();
+    if (!next) return;
+
+    this.pendingPermissionResolve = (reply) => {
+      next.resolve(reply);
+    };
+
+    void this._view?.show?.(true);
+    logAlways("[permission] show panel", {
+      id: next.request.id,
+      action: next.request.action,
+      resources: next.request.resources,
+    });
+    this.postMessage({
+      type: "permissionRequest",
+      payload: {
+        id: next.request.id,
+        action: next.request.action ?? "unknown",
+        resources: next.request.resources ?? [],
+      },
+    });
+
+    // Claude Code 风格：权限等待只进活动条，不写进气泡
+    this.activityLabel = "Waiting for permission…";
+    this.postState();
+    // postState 之后再推一次，避免被其它刷新冲掉面板显示时机
+    this.postMessage({
+      type: "permissionRequest",
+      payload: {
+        id: next.request.id,
+        action: next.request.action ?? "unknown",
+        resources: next.request.resources ?? [],
+      },
+    });
+  }
+
+  private markPermissionResolved(reply: PermissionReply): void {
+    if (reply === "reject") {
+      this.activityLabel = "Permission denied";
+    } else {
+      this.activityLabel = "Working…";
+    }
+    this.postState();
+  }
+
+  /** 取消/结束时清掉未决权限，避免 Promise 挂死导致无法再输入 */
+  private clearPendingPermissions(reply: PermissionReply = "reject"): void {
+    if (this.pendingPermissionResolve) {
+      try {
+        this.pendingPermissionResolve(reply);
+      } catch {
+        // ignore
+      }
+      this.pendingPermissionResolve = null;
+    }
+    for (const item of this.permissionQueue) {
+      try {
+        item.resolve(reply);
+      } catch {
+        // ignore
+      }
+    }
+    this.permissionQueue = [];
+    this.postMessage({ type: "permissionClear" });
   }
 
   // ── 会话管理 ──────────────────────────────────────────────────────────────
@@ -747,12 +991,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         text: string;
         toolCalls?: unknown[];
         attachments?: Attachment[];
+        blocks?: MessageBlock[];
       };
       return {
         role: raw.role as "user" | "assistant",
         text: raw.text,
         toolCalls: (raw.toolCalls ?? []) as ToolCallDisplay[],
         attachments: persistableAttachments(raw.attachments),
+        blocks: Array.isArray(raw.blocks) ? raw.blocks : undefined,
         isStreaming: false, // 从磁盘加载的始终不是流式状态
       };
     });
@@ -812,6 +1058,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               role: m.role,
               text: m.text,
               toolCalls: m.toolCalls,
+              blocks: m.blocks,
               isStreaming: false,
               attachments: persistableAttachments(m.attachments),
             })),
@@ -873,15 +1120,173 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return backendId;
   }
 
+  /** EventBus → 现有 webview 协议（UI 不直连 Runtime） */
+  private onConversationEvent(event: ConversationEvent): void {
+    const localId = this.activeStreamLocalId;
+    if (!localId) return;
+
+    const session =
+      this.sessions.find((s) => s.info.id === event.conversationId) ??
+      this.sessions.find((s) => s.info.id === localId);
+    if (!session) return;
+
+    const lastMsg = session.messages[session.messages.length - 1];
+    if (!lastMsg || lastMsg.role !== "assistant") return;
+
+    switch (event.type) {
+      case "Phase":
+      case "VisionStarted":
+        // 阶段只进活动条，不污染助手气泡（Claude Code 风格）
+        this.activityLabel = "Looking at image…";
+        this.postState();
+        break;
+      case "VisionFinished": {
+        this.activityLabel = "Working…";
+        const visionText = (event.visionText || "").trim();
+        if (visionText) {
+          if (!lastMsg.blocks) lastMsg.blocks = [];
+          const existing = lastMsg.blocks.find((b) => b.kind === "vision");
+          if (existing) {
+            existing.body = visionText;
+            existing.title = "Image recognition";
+          } else {
+            lastMsg.blocks.push({
+              id: crypto.randomUUID(),
+              kind: "vision",
+              title: "Image recognition",
+              body: visionText,
+            });
+          }
+          session.info.lastPreview = lastMessagePreview(session.messages);
+        }
+        this.postState();
+        break;
+      }
+      case "RuntimeStarted":
+        this.activityLabel = "Working…";
+        this.postState();
+        break;
+      case "RuntimeToken":
+        if (event.stream) {
+          if (event.stream.type === "error") {
+            logError("[flow/chat] ← error", event.stream.error);
+          }
+          if (event.stream.type === "tool_use" && event.stream.toolName) {
+            this.activityLabel = this.formatToolActivity(
+              event.stream.toolName,
+              event.stream.toolInput
+            );
+          } else if (event.stream.type === "text" && event.stream.text) {
+            if (this.activityLabel === "Looking at image…") {
+              this.activityLabel = "Working…";
+            }
+          }
+          this.handleStreamEvent(session.info.id, event.stream);
+          this.postState();
+        }
+        break;
+      case "SessionError":
+        if (event.error) {
+          logError("[flow/chat] ✗ 任务失败", event.error);
+        }
+        break;
+      case "SessionFinished":
+      case "SessionCancelled":
+      case "SessionCancelFailed":
+        this.activityLabel = null;
+        this.postState();
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** Claude Code 式活动文案：Read / Edit / Bash … */
+  private formatToolActivity(
+    toolName: string,
+    toolInput?: Record<string, unknown>
+  ): string {
+    const name = String(toolName || "").toLowerCase();
+    const input = toolInput ?? {};
+    const path =
+      (typeof input.path === "string" && input.path) ||
+      (typeof input.file_path === "string" && input.file_path) ||
+      (typeof input.filePath === "string" && input.filePath) ||
+      (typeof input.target_file === "string" && input.target_file) ||
+      "";
+    const short = path
+      ? path.replace(/\\/g, "/").split("/").slice(-2).join("/")
+      : "";
+    const cmd =
+      (typeof input.command === "string" && input.command) ||
+      (typeof input.cmd === "string" && input.cmd) ||
+      "";
+    const cmdShort = cmd.length > 48 ? cmd.slice(0, 48) + "…" : cmd;
+
+    if (name === "read") return short ? `Reading ${short}` : "Reading…";
+    if (name === "write") return short ? `Writing ${short}` : "Writing…";
+    if (
+      name === "edit" ||
+      name === "search_replace" ||
+      name === "apply_patch" ||
+      name === "multiedit"
+    ) {
+      return short ? `Editing ${short}` : "Editing…";
+    }
+    if (name === "bash" || name === "shell" || name === "run_terminal_cmd") {
+      return cmdShort ? `Running ${cmdShort}` : "Running command…";
+    }
+    if (name === "grep") return "Searching…";
+    if (name === "glob" || name === "list" || name === "ls") return "Exploring…";
+    if (name === "webfetch" || name === "websearch") return "Fetching…";
+    return `Working (${toolName})…`;
+  }
+
+  private buildAgentMessage(
+    text: string,
+    saved: Attachment[],
+    incoming?: IncomingAttachment[]
+  ): AgentMessage {
+    const parts: MessagePart[] = [];
+    if (text.trim()) {
+      parts.push({ type: "text", id: newPartId(), text: text.trim() });
+    }
+    for (const a of saved) {
+      if (a.kind === "image") {
+        const incomingMatch = (incoming ?? []).find(
+          (i) => i.id === a.id || i.name === a.name
+        );
+        parts.push({
+          type: "image",
+          id: a.id || newPartId(),
+          mime: a.mime || "image/png",
+          name: a.name,
+          path: a.path,
+          dataUrl: incomingMatch?.dataUrl,
+        });
+      } else {
+        parts.push({
+          type: "file",
+          id: a.id || newPartId(),
+          mime: a.mime || "text/plain",
+          name: a.name,
+          path: a.path,
+          textContent: a.textContent,
+        });
+      }
+    }
+    return {
+      id: newPartId(),
+      role: "user",
+      parts,
+    };
+  }
+
   private async handleSendMessage(
     text: string,
     incomingAttachments?: IncomingAttachment[]
   ): Promise<void> {
-    showDiag(true);
-    logInfo("[flow/chat] ========== 发送消息 ==========");
-
     if (!(await this.ensureInitialized())) {
-      logInfo("[flow/chat] 未就绪，中止");
       this.postError("HxxCode 尚未就绪，请稍后重试");
       return;
     }
@@ -891,7 +1296,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.createLocalSession();
       session = this.getActiveSession();
       if (!session) {
-        logInfo("[flow/chat] 无会话，中止");
         return;
       }
     }
@@ -901,164 +1305,155 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const requestAbort = new AbortController();
-    this.abortController = requestAbort;
-
     const providerStore = this.getProviderStore();
-    const { provider, model } = providerStore?.getActive() ?? {};
-    const supportsVision =
-      provider && model ? modelSupportsVision(provider, model) : true;
+    const { provider } = providerStore?.getActive() ?? {};
+    const imageIncoming = (incomingAttachments ?? []).filter((a) => a.kind === "image");
+    const hasImages = imageIncoming.length > 0;
 
-    logInfo("[flow/chat] 会话/模型", {
-      sessionId: session.info.id,
-      provider: provider?.id,
-      model,
-      supportsVision,
-      textLen: trimmed.length,
-      attachments: (incomingAttachments ?? []).map((a) => ({
-        kind: a.kind,
-        name: a.name,
-        mime: a.mime,
-      })),
-    });
-
-    let attachmentsToSave = incomingAttachments;
-    if (!supportsVision && incomingAttachments?.some((a) => a.kind === "image")) {
-      logInfo("[flow/chat] 模型不支持图片，已剥离 image 附件");
-      this.postError(
-        "当前模型不支持图片，已忽略本次图片附件。请改用支持 Vision 的模型，或新建会话。"
-      );
-      attachmentsToSave = incomingAttachments.filter((a) => a.kind !== "image");
+    let backendId: string;
+    try {
+      backendId = await this.resolveBackendSessionId(session, false);
+    } catch (err) {
+      this.postError(formatErrorMessage(err));
+      return;
     }
 
+    const savedAttachments = await this.persistIncomingAttachments(
+      backendId,
+      incomingAttachments
+    );
+
+    session.messages.push({
+      role: "user",
+      text: trimmed,
+      attachments: savedAttachments.length ? savedAttachments : undefined,
+      toolCalls: [],
+      isStreaming: false,
+    });
+
+    const assistantMsg: ChatMessage = {
+      role: "assistant",
+      text: "",
+      toolCalls: [],
+      isStreaming: true,
+    };
+    session.messages.push(assistantMsg);
+    this.activeStreamLocalId = session.info.id;
+    this.activityLabel = hasImages ? "Looking at image…" : "Working…";
+    this.postState();
+
+    if (session.messages.filter((m) => m.role === "user").length === 1) {
+      const titleBase =
+        trimmed ||
+        savedAttachments.map((a) => a.name).join(", ") ||
+        "新会话";
+      session.info.title =
+        titleBase.slice(0, 40) + (titleBase.length > 40 ? "…" : "");
+    }
+
+    const manager = this.ensureConversationManager();
+    // 标记本轮进行中（cancel 时先清，避免 UI 锁死）
+    this.abortController = new AbortController();
+
+    let visionConfig: {
+      baseURL: string;
+      apiKey: string;
+      model: string;
+    } | null = null;
+
     try {
-      logInfo("[flow/chat] 1. resolveBackendSessionId …");
-      const backendId = await this.resolveBackendSessionId(session, supportsVision);
-      logInfo("[flow/chat] 1. 完成 backendId=", backendId);
-      if (requestAbort.signal.aborted) {
-        logInfo("[flow/chat] 已取消 (resolve 后)");
-        return;
+      if (hasImages) {
+        const visionActive = providerStore?.getActiveVision();
+        const visionProvider = visionActive?.provider ?? provider;
+        const visionModel =
+          visionActive?.model ||
+          (visionProvider ? pickVisionModel(visionProvider, null) : null);
+        if (!visionProvider || !providerStore) {
+          throw new Error("尚未配置供应商，无法识别图片");
+        }
+        if (!visionModel) {
+          throw new Error(
+            "尚未配置识图模型。请在设置中为供应商添加「识图模型」，或在聊天框下拉选择。"
+          );
+        }
+        const apiKey = await providerStore.getApiKey(visionProvider.id);
+        if (!apiKey) {
+          throw new Error("识图需要 API Key，请先在供应商设置中填写");
+        }
+        visionConfig = {
+          baseURL: visionProvider.baseURL,
+          apiKey,
+          model: visionModel,
+        };
       }
 
-      logInfo("[flow/chat] 2. 持久化附件 …");
-      const savedAttachments = await this.persistIncomingAttachments(
-        backendId,
-        attachmentsToSave
-      );
-      logInfo("[flow/chat] 2. 完成 attachments=", savedAttachments.length);
-      if (requestAbort.signal.aborted) {
-        logInfo("[flow/chat] 已取消 (附件后)");
-        return;
-      }
-
-      // 追加用户消息
-      session.messages.push({
-        role: "user",
-        text: trimmed,
-        attachments: savedAttachments.length ? savedAttachments : undefined,
-        toolCalls: [],
-        isStreaming: false,
-      });
-
-      // 创建占位的 assistant 消息（流式输出会不断更新它）
-      const assistantMsg: ChatMessage = {
-        role: "assistant",
-        text: "",
-        toolCalls: [],
-        isStreaming: true,
-      };
-      session.messages.push(assistantMsg);
-
-      this.postState();
-
-      // 自动重命名会话（第一轮对话时）
-      if (session.messages.filter((m) => m.role === "user").length === 1) {
-        const titleBase =
-          trimmed ||
-          savedAttachments.map((a) => a.name).join(", ") ||
-          "新会话";
-        session.info.title =
-          titleBase.slice(0, 40) + (titleBase.length > 40 ? "…" : "");
-      }
-
-      logInfo("[flow/chat] 3. toPromptAttachments …");
-      const promptAttachments = await this.toPromptAttachments(
-        savedAttachments,
-        supportsVision
-      );
-      logInfo("[flow/chat] 3. 完成", {
-        images: promptAttachments?.images?.length ?? 0,
-        texts: promptAttachments?.texts?.length ?? 0,
-      });
-      if (promptAttachments?.images?.length) {
-        session.info.backendMayContainImages = true;
-      }
-
-      logInfo("[flow/chat] 4. promptStream 开始 …");
-      await this.requireOpencodeManager().promptStream(
-        backendId,
+      const agentMessage = this.buildAgentMessage(
         trimmed,
-        (event) => {
-          // 已点停止后忽略迟到的流事件，避免 UI 又回到“生成中”
-          if (requestAbort.signal.aborted) return;
-          if (this.abortController !== requestAbort) return;
-          if (event.type === "text") {
-            logInfo("[flow/chat] ← text delta len=", event.text?.length ?? 0);
-          } else if (event.type === "tool_use") {
-            logInfo("[flow/chat] ← tool_use", event.toolName, event.toolCallId);
-          } else if (event.type === "tool_result") {
-            logInfo("[flow/chat] ← tool_result", event.toolName, event.toolCallId);
-          } else if (event.type === "error") {
-            logInfo("[flow/chat] ← error", event.error);
-          } else if (event.type === "finish") {
-            logInfo("[flow/chat] ← finish");
-          }
-          this.handleStreamEvent(session!.info.id, event);
-        },
-        requestAbort.signal,
-        promptAttachments
+        savedAttachments,
+        incomingAttachments
       );
-      logInfo("[flow/chat] 4. promptStream 返回");
+
+      // conversationId 与 backendId 对齐，便于单飞与取消确认
+      const result = await manager.send({
+        conversationId: backendId,
+        backendSessionId: backendId,
+        message: agentMessage,
+        vision: visionConfig,
+        persist: () => {
+          session.info.messageCount = session.messages.length;
+          session.info.lastPreview = lastMessagePreview(session.messages);
+          this.saveSessionsToDisk();
+        },
+      });
+
+      if (result.status === "failed") {
+        const msg = result.error || "Task failed";
+        logError("[flow/chat] ✗ 任务失败", msg);
+        if (!assistantMsg.text.includes("Error:")) {
+          assistantMsg.text += `\n\nError: ${msg}`;
+        }
+        this.postError(msg);
+      } else if (result.status === "cancelled") {
+        if (!assistantMsg.text.includes("Interrupted")) {
+          assistantMsg.text +=
+            (assistantMsg.text ? "\n\n" : "") + "Interrupted.";
+        }
+      } else if (result.status === "cancel_failed") {
+        const tip =
+          "Stopped, but the remote agent may still be busy. Send again, or restart HxxCode Server / start a new chat.";
+        if (!assistantMsg.text.includes("remote agent may still")) {
+          assistantMsg.text += (assistantMsg.text ? "\n\n" : "") + tip;
+        }
+        this.postError(tip);
+      }
     } catch (err) {
       const msg = formatErrorMessage(err);
-      logInfo("[flow/chat] ✗ 异常", msg);
-      const last = session.messages[session.messages.length - 1];
-      const assistantMsg =
-        last?.role === "assistant" ? last : null;
+      logError("[flow/chat] ✗ 异常", msg);
       if (
-        requestAbort.signal.aborted ||
         msg.includes("aborted") ||
         msg.includes("cancel") ||
         msg.includes("terminated")
       ) {
-        if (assistantMsg && !assistantMsg.text.includes("*已取消*")) {
-          assistantMsg.text += (assistantMsg.text ? "\n\n" : "") + "*已取消*";
+        if (!assistantMsg.text.includes("Interrupted")) {
+          assistantMsg.text +=
+            (assistantMsg.text ? "\n\n" : "") + "Interrupted.";
         }
       } else {
-        if (isImageUnsupportedError(msg)) {
-          session.info.backendMayContainImages = true;
-        }
         this.postError(msg);
-        if (assistantMsg) {
-          assistantMsg.text += `\n\n**错误**: ${msg}`;
-        } else {
-          session.messages.push({
-            role: "assistant",
-            text: `**错误**: ${msg}`,
-            toolCalls: [],
-            isStreaming: false,
-          });
+        if (!assistantMsg.text.includes("Error:")) {
+          assistantMsg.text += `\n\nError: ${msg}`;
         }
       }
     } finally {
-      const last = session.messages[session.messages.length - 1];
-      if (last?.role === "assistant") last.isStreaming = false;
-      if (this.abortController === requestAbort) {
-        this.abortController = null;
+      assistantMsg.isStreaming = false;
+      this.activityLabel = null;
+      this.clearPendingPermissions("reject");
+      this.abortController = null;
+      if (this.activeStreamLocalId === session.info.id) {
+        this.activeStreamLocalId = null;
       }
       session.info.messageCount = session.messages.length;
       session.info.lastPreview = lastMessagePreview(session.messages);
-      logInfo("[flow/chat] ========== 发送结束 ==========");
       this.postState();
       this.saveSessionsToDisk();
     }
@@ -1231,7 +1626,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (isImageUnsupportedError(errText)) {
             session.info.backendMayContainImages = true;
           }
-          lastMsg.text += `\n\n**错误**: ${errText}`;
+          lastMsg.text += `\n\nError: ${errText}`;
           this.postError(errText);
         }
         break;
@@ -1244,37 +1639,68 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // ── 取消 / 重试 ───────────────────────────────────────────────────────────
 
-  private cancelResponse(): void {
-    const ac = this.abortController;
-    if (!ac) {
-      logInfo("[flow/chat] 停止：当前没有进行中的请求");
-      return;
-    }
+  private async cancelResponse(): Promise<void> {
+    this.clearPendingPermissions("reject");
 
-    logInfo("[flow/chat] 用户点击停止 → abort");
-    // 立刻解锁输入框/停止按钮（不必等后端 SSE 真正断开）
-    this.abortController = null;
     const session = this.getActiveSession();
-    if (session) {
-      const last = session.messages[session.messages.length - 1];
-      if (last?.role === "assistant") {
-        last.isStreaming = false;
-        for (const tc of last.toolCalls) tc.isRunning = false;
-        if (!last.text.includes("*已取消*")) {
-          last.text += (last.text ? "\n\n" : "") + "*已取消*";
-        }
+    const conversationId = session?.info.id;
+    const manager = this.conversationManager;
+
+    const streamingAssistant = session
+      ? [...session.messages]
+          .reverse()
+          .find((m) => m.role === "assistant" && m.isStreaming)
+      : undefined;
+
+    // 立刻解锁输入
+    if (streamingAssistant) {
+      streamingAssistant.isStreaming = false;
+      for (const tc of streamingAssistant.toolCalls) tc.isRunning = false;
+    }
+    const ac = this.abortController;
+    if (ac) {
+      try {
+        ac.abort();
+      } catch {
+        // ignore
       }
-      session.info.messageCount = session.messages.length;
-      session.info.lastPreview = lastMessagePreview(session.messages);
+      if (this.abortController === ac) {
+        this.abortController = null;
+      }
     }
     this.postState();
 
-    // 再中断 SDK 的 HTTP/SSE（卡在「无输出」时也能解开）
+    if (!conversationId || !manager) {
+      return;
+    }
+
     try {
-      ac.abort();
-      logInfo("[flow/chat] abort() 已调用");
+      const result = await manager.cancel(conversationId, 20_000);
+      const target =
+        streamingAssistant ??
+        (session?.messages[session.messages.length - 1]?.role === "assistant"
+          ? session.messages[session.messages.length - 1]
+          : undefined);
+      if (session && target) {
+        if (result === "cancel_failed") {
+          const tip =
+            "Stopped, but the remote agent may still be busy. Send again, or restart HxxCode Server / start a new chat.";
+          if (!target.text.includes("remote agent may still")) {
+            target.text += (target.text ? "\n\n" : "") + tip;
+          }
+          this.postError(tip);
+        } else if (!target.text.includes("Interrupted") && !target.text.includes("*已取消*")) {
+          target.text += (target.text ? "\n\n" : "") + "Interrupted.";
+        }
+        session.info.messageCount = session.messages.length;
+        session.info.lastPreview = lastMessagePreview(session.messages);
+      }
     } catch (err) {
-      logInfo("[flow/chat] abort() 异常", String(err));
+      logError("[flow/chat] cancel 异常", formatErrorMessage(err));
+      this.postError(`取消失败: ${formatErrorMessage(err)}`);
+    } finally {
+      this.postState();
+      this.saveSessionsToDisk();
     }
   }
 
@@ -1534,12 +1960,104 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     gap: 12px;
   }
   .messages:empty::after {
-    content: "有什么可以帮你的？";
+    content: "How can I help you today?";
     display: block;
     text-align: center;
     color: var(--muted);
-    font-size: 13px;
-    margin-top: 48px;
+    font-size: 14px;
+    font-weight: 500;
+    margin-top: 56px;
+    letter-spacing: 0.01em;
+  }
+
+  /* Claude Code–style activity strip */
+  .activity-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px 0;
+    font-size: 12px;
+    color: var(--muted);
+    flex-shrink: 0;
+  }
+  .activity-bar.hidden { display: none; }
+  .activity-bar .spin {
+    width: 10px; height: 10px;
+    border: 1.5px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .activity-bar .label {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: var(--mono-font);
+    font-size: 11.5px;
+  }
+
+  .msg-actions {
+    display: none;
+    gap: 4px;
+    margin-top: 4px;
+  }
+  .msg-row.assistant:hover .msg-actions { display: flex; }
+  .msg-action-btn {
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .msg-action-btn:hover { background: var(--surface-hover); color: var(--fg); }
+
+  .tool-steps {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    border-left: 2px solid var(--border-subtle);
+    padding-left: 10px;
+  }
+  .tool-step {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 12px;
+    line-height: 1.45;
+    padding: 2px 0;
+    color: var(--muted);
+  }
+  .tool-step.running { color: var(--fg); }
+  .tool-step .verb {
+    font-family: var(--mono-font);
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--fg);
+    flex-shrink: 0;
+  }
+  .tool-step .detail {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono-font);
+    font-size: 11px;
+  }
+  .tool-step.clickable { cursor: pointer; }
+  .tool-step.clickable:hover .detail { color: var(--accent); text-decoration: underline; }
+  .tool-step .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--border);
+    flex-shrink: 0;
+    margin-top: 5px;
+  }
+  .tool-step.running .dot {
+    background: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-soft);
   }
 
   .msg-row {
@@ -1689,6 +2207,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
   .tool-card.open .tool-card-body { display: block; }
 
+  /* 识图 / Files 折叠块（默认收起，可点开看详情） */
+  .ctx-block {
+    margin: 6px 0;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: color-mix(in srgb, var(--bg) 96%, var(--accent));
+  }
+  .ctx-block-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 11.5px;
+  }
+  .ctx-block-header:hover { background: var(--surface-hover); }
+  .ctx-block-header .chevron {
+    font-size: 9px;
+    color: var(--muted);
+    transition: transform 0.12s;
+  }
+  .ctx-block.open .ctx-block-header .chevron { transform: rotate(90deg); }
+  .ctx-block-title {
+    flex: 1;
+    min-width: 0;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ctx-block-body {
+    display: none;
+    padding: 8px 10px 10px;
+    border-top: 1px solid var(--border-subtle);
+    font-size: 11.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 240px;
+    overflow-y: auto;
+  }
+  .ctx-block.open .ctx-block-body { display: block; }
+
   /* ── Tool group (Cursor-style file list) ── */
   .tool-group {
     margin: 6px 0;
@@ -1725,11 +2288,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     padding: 4px 0;
   }
   .tool-group.open .tool-group-body { display: block; }
+  .file-change-wrap { border-bottom: 1px solid var(--border-subtle); }
+  .file-change-wrap:last-child { border-bottom: none; }
   .file-change-item {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 5px 10px 5px 12px;
+    padding: 5px 10px 5px 8px;
     font-size: 12px;
     line-height: 1.35;
   }
@@ -1739,6 +2304,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .file-change-item.clickable:hover {
     background: var(--surface-hover);
   }
+  .file-chevron {
+    flex: 0 0 10px;
+    font-size: 9px;
+    color: var(--muted);
+    transition: transform 0.12s;
+  }
+  .file-change-wrap.open .file-chevron { transform: rotate(90deg); }
+  .file-change-detail {
+    display: none;
+    padding: 0 10px 8px 28px;
+  }
+  .file-change-wrap.open .file-change-detail { display: block; }
+  .file-diff-pre {
+    margin: 0 0 6px;
+    padding: 8px;
+    max-height: 180px;
+    overflow: auto;
+    font-family: var(--mono-font);
+    font-size: 10.5px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--code-bg);
+    border: 1px solid var(--border-subtle);
+    border-radius: 5px;
+  }
+  .file-change-actions { display: flex; gap: 6px; }
+  .file-action-btn {
+    border: 1px solid var(--border-subtle);
+    background: transparent;
+    color: var(--fg);
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .file-action-btn:hover { background: var(--surface-hover); color: var(--accent); }
   .file-badge {
     flex: 0 0 auto;
     width: 18px;
@@ -1798,7 +2400,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     color: var(--muted);
   }
 
-  /* ── Permission panel ── */
+  /* ── Permission panel（贴在输入区上方，避免被消息区挤没） ── */
   .permission-panel {
     margin: 0 10px 8px;
     padding: 10px 12px;
@@ -1806,8 +2408,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     border-radius: var(--radius-sm);
     background: var(--accent-soft);
     flex-shrink: 0;
+    z-index: 20;
+    box-shadow: 0 -4px 16px rgba(0,0,0,0.18);
   }
-  .permission-panel.hidden { display: none; }
+  .permission-panel.hidden { display: none !important; }
   .permission-title { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
   .permission-detail {
     font-size: 11px; color: var(--muted);
@@ -1950,8 +2554,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     font-family: var(--font);
     font-size: 12.5px;
     line-height: 1.5;
-    min-height: 30px;
-    max-height: 120px;
+    min-height: 56px;   /* 约 3 行，避免默认就出垂直滚动条 */
+    max-height: 160px;
+    overflow-y: auto;
   }
   .composer-box textarea::placeholder { color: var(--muted); }
   .composer-toolbar {
@@ -1974,6 +2579,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     max-width: 160px;
   }
   .model-chip:hover { border-color: var(--border); color: var(--fg); }
+  .model-chip.vision .dot,
+  .model-chip .dot.vision {
+    background: linear-gradient(135deg, #d4a017, #c9a227);
+  }
   .model-chip .dot {
     width: 10px; height: 10px;
     border-radius: 3px;
@@ -2050,6 +2659,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
   .model-item:hover { background: var(--surface-hover); }
   .model-item.active { background: var(--accent-soft); color: var(--accent); }
+  .model-item.vision.active { color: #c9a227; }
+  .model-item.muted { color: var(--muted); cursor: default; font-size: 11px; }
   .manage-link {
     display: flex; align-items: center; gap: 5px;
     margin-top: 4px; padding: 6px 8px;
@@ -2140,26 +2751,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </div>
 
   <!-- Messages -->
-  <div class="messages" id="messagesContainer"></div>
+  <div class="messages" id="messagesContainer" style="order:1"></div>
 
-  <!-- Permission panel -->
-  <div class="permission-panel hidden" id="permissionPanel">
-    <div class="permission-title" id="permissionTitle">需要您的确认</div>
+  <div class="activity-bar hidden" id="activityBar" style="order:2">
+    <span class="spin" aria-hidden="true"></span>
+    <span class="label" id="activityLabel">Working…</span>
+  </div>
+
+  <!-- Permission panel：紧贴输入框上方 -->
+  <div class="permission-panel hidden" id="permissionPanel" style="order:3">
+    <div class="permission-title" id="permissionTitle">Permission required</div>
     <div class="permission-detail" id="permissionDetail"></div>
     <div class="permission-actions">
-      <button type="button" data-reply="once">允许一次</button>
-      <button type="button" data-reply="always">始终允许</button>
-      <button type="button" data-reply="reject" class="secondary">拒绝</button>
+      <button type="button" data-reply="once">Allow</button>
+      <button type="button" data-reply="always">Always allow</button>
+      <button type="button" data-reply="reject" class="secondary">Deny</button>
     </div>
   </div>
 
   <!-- Composer -->
-  <div class="composer" style="position:relative">
+  <div class="composer" style="position:relative;order:4">
     <div class="model-popover" id="modelPopover">
       <div class="pop-label">供应商</div>
       <div class="provider-chips" id="providerChips"></div>
-      <div class="pop-label">模型</div>
+      <div class="pop-label">对话 / 编程模型</div>
       <div class="model-list" id="modelList"></div>
+      <div class="pop-label">识图模型</div>
+      <div class="model-list" id="visionModelList"></div>
       <div class="manage-link" id="manageLink">
         <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M8 1v2M8 13v2M2.5 4.5l1.5 1.5M12 10l1.5 1.5M1 8h2M13 8h2M2.5 11.5L4 10M12 6l1.5-1.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
         管理供应商与模型…
@@ -2168,20 +2786,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     <div class="composer-box">
       <div class="attach-preview" id="attachPreview"></div>
-      <textarea id="inputBox" placeholder="输入消息，Enter 发送，Shift+Enter 换行" rows="1"></textarea>
+      <textarea id="inputBox" placeholder="Ask anything…  Enter to send, Shift+Enter for newline" rows="3"></textarea>
       <div class="composer-toolbar">
         <div class="left">
           <button type="button" class="attach-btn" id="attachBtn" title="添加附件：图片或文本文件（最多5个；图片≤5MB；文本≤200KB）。不支持 PDF/Office/压缩包/音视频等" aria-label="添加附件">
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
           </button>
           <input type="file" id="fileInput" multiple hidden />
-          <button class="model-chip" id="modelChip">
+          <button class="model-chip" id="modelChip" title="选择对话模型">
             <span class="dot"></span>
             <span class="mname" id="modelChipName">模型</span>
             <svg class="chev" width="8" height="8" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
+          <button class="model-chip vision" id="visionChip" title="选择识图模型">
+            <span class="dot vision"></span>
+            <span class="mname" id="visionChipName">识图</span>
+            <svg class="chev" width="8" height="8" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
         </div>
-        <button class="send-btn" id="sendBtn" title="发送" aria-label="发送">
+        <button class="send-btn" id="sendBtn" title="Send" aria-label="Send">
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M4 7l4-4 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
       </div>

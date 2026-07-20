@@ -17,15 +17,20 @@
     const settingsBtn = $("settingsBtn");
     const modelChip = $("modelChip");
     const modelChipName = $("modelChipName");
+    const visionChip = $("visionChip");
+    const visionChipName = $("visionChipName");
     const modelPopover = $("modelPopover");
     const providerChips = $("providerChips");
     const modelList = $("modelList");
+    const visionModelList = $("visionModelList");
     const manageLink = $("manageLink");
     const permissionPanel = $("permissionPanel");
     const permissionTitle = $("permissionTitle");
     const permissionDetail = $("permissionDetail");
     const statusLeft = $("statusLeft");
     const statusRight = $("statusRight");
+    const activityBar = $("activityBar");
+    const activityLabelEl = $("activityLabel");
 
     const SEND_ICON =
       '<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M4 7l4-4 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -59,7 +64,10 @@
       providers: [],
       activeProviderId: null,
       activeModel: null,
+      activeVisionProviderId: null,
+      activeVisionModel: null,
       isStreaming: false,
+      activity: null,
     };
 
     const MAX_VISIBLE_SESSIONS = 20;
@@ -67,13 +75,36 @@
     let pendingPermissionId = null;
 
     const ACTION_LABELS = {
-      external_directory: "访问工作区外目录",
-      edit: "编辑文件",
-      write: "写入文件",
-      read: "读取文件",
-      bash: "执行命令",
-      glob: "搜索文件",
-      grep: "搜索内容",
+      external_directory: "Access outside workspace",
+      edit: "Edit file",
+      write: "Write file",
+      read: "Read file",
+      bash: "Run command",
+      shell: "Run command",
+      glob: "Search files",
+      grep: "Search content",
+      doom_loop: "Repeated tool calls",
+      webfetch: "Fetch URL",
+      websearch: "Web search",
+    };
+
+    const TOOL_VERBS = {
+      read: "Read",
+      write: "Write",
+      edit: "Edit",
+      search_replace: "Edit",
+      apply_patch: "Edit",
+      patch: "Edit",
+      multiedit: "Edit",
+      bash: "Bash",
+      shell: "Bash",
+      run_terminal_cmd: "Bash",
+      grep: "Grep",
+      glob: "Glob",
+      list: "List",
+      ls: "List",
+      webfetch: "Fetch",
+      websearch: "Search",
     };
 
     // ── State update ──
@@ -85,6 +116,37 @@
       renderMessages();
       updateInputState();
       updateStatusBar();
+      updateActivityBar();
+    }
+
+    function updateActivityBar() {
+      if (!activityBar || !activityLabelEl) return;
+      let label = state.activity;
+      if (!label && state.isStreaming) {
+        const last = state.messages[state.messages.length - 1];
+        const running = last?.toolCalls?.find((t) => t.isRunning);
+        label = running
+          ? formatToolStepLabel(running)
+          : "Working…";
+      }
+      if (state.isStreaming && label) {
+        activityLabelEl.textContent = label;
+        activityBar.classList.remove("hidden");
+      } else {
+        activityBar.classList.add("hidden");
+      }
+    }
+
+    /** Strip legacy phase noise from assistant bubbles */
+    function cleanAssistantText(text) {
+      if (!text) return "";
+      return String(text)
+        .replace(/^📷[^\n]*\n*/g, "")
+        .replace(/\n*📷 图片识别完成，交由 Agent 继续处理…\n*/g, "\n")
+        .replace(/\n*📷[^\n]*识别图片[^\n]*\n*/g, "\n")
+        .replace(/\*\*错误\*\*:\s*/g, "Error: ")
+        .replace(/\*已取消\*/g, "Interrupted.")
+        .trim();
     }
 
     // ── Session picker ──
@@ -101,12 +163,14 @@
       const searchInput = document.getElementById("sessionSearch");
       const searchTerm = (searchInput?.value ?? "").trim().toLowerCase();
 
-      // 过滤
+      // 过滤：标题 + 预览（含 Vision 摘要），便于会话列表追溯查询
       let filtered = state.sessionList;
       if (searchTerm) {
-        filtered = filtered.filter((s) =>
-          s.title.toLowerCase().includes(searchTerm)
-        );
+        filtered = filtered.filter((s) => {
+          const title = (s.title || "").toLowerCase();
+          const preview = (s.lastPreview || "").toLowerCase();
+          return title.includes(searchTerm) || preview.includes(searchTerm);
+        });
       }
 
       // 渲染（限制显示数量）
@@ -203,13 +267,13 @@
         chip.addEventListener("click", () => {
           vscode.postMessage({
             type: "switchModel",
-            payload: { providerId: p.id, model: p.models[0] || "" },
+            payload: { providerId: p.id, model: (p.models && p.models[0]) || "" },
           });
-          // popover 不自动关闭，让用户进一步选择模型
         });
         providerChips.appendChild(chip);
       }
       renderModels();
+      renderVisionModels();
     }
 
     function renderModels() {
@@ -217,7 +281,14 @@
       const provider = state.providers.find((p) => p.id === state.activeProviderId);
       modelList.innerHTML = "";
       if (provider) {
-        for (const m of provider.models) {
+        const list = provider.models || [];
+        if (list.length === 0) {
+          const empty = document.createElement("div");
+          empty.className = "model-item muted";
+          empty.textContent = "暂无对话模型，请到设置添加";
+          modelList.appendChild(empty);
+        }
+        for (const m of list) {
           const item = document.createElement("div");
           item.className = "model-item" + (m === state.activeModel ? " active" : "");
           item.textContent = m;
@@ -235,9 +306,46 @@
       updateModelChip();
     }
 
+    function renderVisionModels() {
+      if (!visionModelList) return;
+      visionModelList.innerHTML = "";
+      const provider =
+        state.providers.find((p) => p.id === state.activeVisionProviderId) ||
+        state.providers.find((p) => p.id === state.activeProviderId);
+      const list = (provider && provider.visionModels) || [];
+      if (!provider || list.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "model-item muted";
+        empty.textContent = "暂无识图模型，请到设置添加";
+        visionModelList.appendChild(empty);
+      } else {
+        for (const m of list) {
+          const item = document.createElement("div");
+          item.className =
+            "model-item vision" +
+            (m === state.activeVisionModel ? " active" : "");
+          item.textContent = m;
+          item.addEventListener("click", () => {
+            vscode.postMessage({
+              type: "switchVisionModel",
+              payload: { providerId: provider.id, model: m },
+            });
+            closePopover();
+          });
+          visionModelList.appendChild(item);
+        }
+      }
+      updateVisionChip();
+    }
+
     function updateModelChip() {
       if (!modelChipName) return;
-      modelChipName.textContent = state.activeModel || "选择模型";
+      modelChipName.textContent = state.activeModel || "对话模型";
+    }
+
+    function updateVisionChip() {
+      if (!visionChipName) return;
+      visionChipName.textContent = state.activeVisionModel || "识图模型";
     }
 
     // ── Messages ──
@@ -247,21 +355,19 @@
       const wasAtBottom = isAtBottom();
       messagesEl.innerHTML = "";
 
-      for (const msg of state.messages) {
+      for (let mi = 0; mi < state.messages.length; mi++) {
+        const msg = state.messages[mi];
         const row = document.createElement("div");
         row.className = "msg-row " + (msg.role === "user" ? "user" : "assistant");
 
-        // 头像
         const avatar = document.createElement("div");
-        avatar.className = "avatar " + msg.role;
-        avatar.textContent = msg.role === "user" ? "你" : "AI";
+        avatar.className = "avatar " + (msg.role === "user" ? "user" : "ai");
+        avatar.textContent = msg.role === "user" ? "You" : "H";
         row.appendChild(avatar);
 
-        // 消息体
         const body = document.createElement("div");
         body.className = "msg-body";
 
-        // 附件
         if (msg.attachments && msg.attachments.length > 0) {
           const wrap = document.createElement("div");
           wrap.className = "msg-attachments";
@@ -270,40 +376,78 @@
               const img = document.createElement("img");
               img.className = "msg-attach-img";
               img.src = att.previewUrl || att.dataUrl;
-              img.alt = att.name || "图片";
-              img.title = att.name || "点击放大预览";
+              img.alt = att.name || "image";
+              img.title = att.name || "Preview";
               img.addEventListener("click", () => {
-                openImagePreview(img.src, att.name || "图片");
+                openImagePreview(img.src, att.name || "image");
               });
               wrap.appendChild(img);
             } else {
               const chip = document.createElement("span");
               chip.className = "msg-attach-chip";
-              chip.textContent = att.name || "附件";
-              chip.title = att.name || "附件";
+              chip.textContent = att.name || "file";
+              chip.title = att.name || "file";
               wrap.appendChild(chip);
             }
           }
           body.appendChild(wrap);
         }
 
-        // 文本内容
-        if (msg.text) {
+        // 识图结果：默认折叠的 Files 式控件，落盘后可追溯
+        if (msg.blocks && msg.blocks.length > 0) {
+          for (const block of msg.blocks) {
+            body.appendChild(renderContextBlock(block));
+          }
+        }
+
+        // Tools（步骤列表）
+        if (msg.role === "assistant" && msg.toolCalls && msg.toolCalls.length > 0) {
+          body.appendChild(renderToolSteps(msg.toolCalls));
+          // 文件变更汇总：默认折叠 Files
+          const filesGroup = renderFilesGroup(msg.toolCalls);
+          if (filesGroup) body.appendChild(filesGroup);
+        }
+
+        const displayText =
+          msg.role === "assistant" ? cleanAssistantText(msg.text) : msg.text;
+        if (displayText) {
           const textDiv = document.createElement("div");
-          textDiv.className = "msg-text" + (msg.text.startsWith("**错误**") ? " error" : "");
-          textDiv.innerHTML = renderMarkdown(msg.text);
+          const isErr =
+            displayText.startsWith("Error:") || displayText.startsWith("**错误**");
+          textDiv.className = "msg-text" + (isErr ? " error" : "");
+          textDiv.innerHTML = renderMarkdown(displayText);
           if (msg.isStreaming) textDiv.classList.add("streaming-cursor");
           body.appendChild(textDiv);
-        } else if (msg.isStreaming) {
+        } else if (msg.isStreaming && !(msg.toolCalls && msg.toolCalls.length)) {
           const cursor = document.createElement("span");
           cursor.className = "streaming-cursor";
           cursor.style.display = "inline-block";
           body.appendChild(cursor);
         }
 
-        // 工具调用 — 合并为 Cursor 风格的折叠文件列表
-        if (msg.toolCalls && msg.toolCalls.length > 0) {
-          body.appendChild(renderToolCallsGroup(msg.toolCalls));
+        if (msg.role === "assistant" && !msg.isStreaming) {
+          const actions = document.createElement("div");
+          actions.className = "msg-actions";
+          const copyBtn = document.createElement("button");
+          copyBtn.type = "button";
+          copyBtn.className = "msg-action-btn";
+          copyBtn.textContent = "Copy";
+          copyBtn.addEventListener("click", () => {
+            const t = cleanAssistantText(msg.text || "");
+            if (t) navigator.clipboard?.writeText(t).catch(() => {});
+          });
+          actions.appendChild(copyBtn);
+          if (mi === state.messages.length - 1) {
+            const retryBtn = document.createElement("button");
+            retryBtn.type = "button";
+            retryBtn.className = "msg-action-btn";
+            retryBtn.textContent = "Retry";
+            retryBtn.addEventListener("click", () => {
+              vscode.postMessage({ type: "retryLastMessage" });
+            });
+            actions.appendChild(retryBtn);
+          }
+          body.appendChild(actions);
         }
 
         row.appendChild(body);
@@ -311,6 +455,134 @@
       }
 
       if (wasAtBottom || state.messages.length === 0) scrollToBottom();
+    }
+
+    function renderContextBlock(block) {
+      const group = document.createElement("div");
+      group.className = "ctx-block";
+      const header = document.createElement("div");
+      header.className = "ctx-block-header";
+      const kindLabel =
+        block.kind === "vision" ? "Vision" : block.title || "Details";
+      const preview = String(block.body || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 42);
+      header.innerHTML =
+        '<span class="chevron">▶</span>' +
+        '<span class="ctx-block-title">' +
+        escapeHtml(block.title || kindLabel) +
+        "</span>" +
+        '<span class="status-pill done">' +
+        escapeHtml(kindLabel) +
+        "</span>";
+      const body = document.createElement("div");
+      body.className = "ctx-block-body";
+      body.textContent = block.body || "";
+      if (preview && !block.body) {
+        body.textContent = preview;
+      }
+      header.addEventListener("click", () => {
+        group.classList.toggle("open");
+      });
+      group.appendChild(header);
+      group.appendChild(body);
+      return group;
+    }
+
+    /** 文件类工具汇总为可折叠 Files（默认收起） */
+    function renderFilesGroup(toolCalls) {
+      const activity = buildToolActivity(toolCalls);
+      if (!activity.files.length) return null;
+
+      const group = document.createElement("div");
+      group.className = "ctx-block";
+      const header = document.createElement("div");
+      header.className = "ctx-block-header";
+      header.innerHTML =
+        '<span class="chevron">▶</span>' +
+        '<span class="ctx-block-title">' +
+        activity.files.length +
+        " files</span>" +
+        '<span class="status-pill ' +
+        (activity.anyRunning ? "running" : "done") +
+        '">' +
+        (activity.anyRunning ? "Running" : "Files") +
+        "</span>";
+      const body = document.createElement("div");
+      body.className = "ctx-block-body";
+      body.style.padding = "4px 6px 8px";
+      for (const file of activity.files) {
+        body.appendChild(renderFileChangeItem(file));
+      }
+      header.addEventListener("click", () => {
+        group.classList.toggle("open");
+      });
+      group.appendChild(header);
+      group.appendChild(body);
+      return group;
+    }
+
+    function formatToolStepLabel(tc) {
+      const verb =
+        TOOL_VERBS[String(tc.name || "").toLowerCase()] ||
+        (tc.name ? String(tc.name) : "Tool");
+      const path = extractFilePath(tc.name, tc.input);
+      const short = path
+        ? String(path).replace(/\\/g, "/").split("/").slice(-2).join("/")
+        : "";
+      if (short && (verb === "Read" || verb === "Write" || verb === "Edit" || verb === "List")) {
+        return verb + " " + short;
+      }
+      if (verb === "Bash") {
+        const cmd = extractCommand(tc.input);
+        const c = cmd.length > 56 ? cmd.slice(0, 56) + "…" : cmd;
+        return c ? "Bash " + c : "Bash";
+      }
+      if (verb === "Grep" || verb === "Glob") {
+        const data = parseToolInput(tc.input);
+        const p = data.pattern || data.glob_pattern || "";
+        return p ? verb + ' "' + String(p).slice(0, 40) + '"' : verb;
+      }
+      return verb;
+    }
+
+    function renderToolSteps(toolCalls) {
+      const wrap = document.createElement("div");
+      wrap.className = "tool-steps";
+      for (const tc of toolCalls) {
+        const row = document.createElement("div");
+        row.className = "tool-step" + (tc.isRunning ? " running" : "");
+        const path = extractFilePath(tc.name, tc.input);
+        if (path) row.classList.add("clickable");
+
+        const dot = document.createElement("span");
+        dot.className = "dot";
+        const verb = document.createElement("span");
+        verb.className = "verb";
+        const verbName =
+          TOOL_VERBS[String(tc.name || "").toLowerCase()] || tc.name || "Tool";
+        verb.textContent = verbName;
+        const detail = document.createElement("span");
+        detail.className = "detail";
+        const label = formatToolStepLabel(tc);
+        detail.textContent = label.startsWith(verbName)
+          ? label.slice(verbName.length).trim()
+          : label;
+        detail.title = path || extractCommand(tc.input) || label;
+
+        row.appendChild(dot);
+        row.appendChild(verb);
+        if (detail.textContent) row.appendChild(detail);
+
+        if (path) {
+          row.addEventListener("click", () => {
+            vscode.postMessage({ type: "openFile", payload: { path } });
+          });
+        }
+        wrap.appendChild(row);
+      }
+      return wrap;
     }
 
     const FILE_MODIFY_TOOLS = new Set([
@@ -415,10 +687,23 @@
         return { label: "+" + addLines + " -" + delLines, kind: "diff" };
       }
 
+      const data = parseToolInput(input);
+      if (
+        data.old_string != null ||
+        data.new_string != null ||
+        data.oldString != null ||
+        data.newString != null
+      ) {
+        const oldT = String(data.old_string ?? data.oldString ?? "");
+        const newT = String(data.new_string ?? data.newString ?? "");
+        const oldN = oldT ? oldT.split("\n").length : 0;
+        const newN = newT ? newT.split("\n").length : 0;
+        return { label: "+" + newN + " -" + oldN, kind: "diff" };
+      }
+
       if (toolName === "write") return { label: "新建", kind: "created" };
       if (FILE_MODIFY_TOOLS.has(toolName)) return { label: "已修改", kind: "modified" };
 
-      const data = parseToolInput(input);
       if (toolName === "grep" && data.pattern) {
         const p = String(data.pattern);
         return {
@@ -440,6 +725,73 @@
       return { label: "", kind: "other" };
     }
 
+    /** 从工具入参/结果提取可展示的改动内容（Cursor Review 风格） */
+    function extractChangePayload(toolName, input, result) {
+      const data = parseToolInput(input);
+      const name = String(toolName || "").toLowerCase();
+      const oldText = data.old_string ?? data.oldString ?? data.old ?? null;
+      const newText =
+        data.new_string ?? data.newString ?? data.new ?? data.content ?? data.contents ?? null;
+      const patch =
+        typeof data.patch === "string"
+          ? data.patch
+          : typeof data.diff === "string"
+            ? data.diff
+            : null;
+
+      let preview = "";
+      if (oldText != null || (newText != null && name !== "write" && name !== "read")) {
+        const o = String(oldText ?? "");
+        const n = String(newText ?? "");
+        const oLines = o.split("\n");
+        const nLines = n.split("\n");
+        const max = 80;
+        const del = oLines
+          .slice(0, max)
+          .map((l) => "- " + l)
+          .join("\n");
+        const add = nLines
+          .slice(0, max)
+          .map((l) => "+ " + l)
+          .join("\n");
+        preview = (del ? del + "\n" : "") + (add || "");
+        if (oLines.length > max || nLines.length > max) {
+          preview += "\n…";
+        }
+      } else if (patch) {
+        preview = String(patch).slice(0, 6000);
+      } else if (name === "write" && newText != null) {
+        preview = String(newText)
+          .split("\n")
+          .slice(0, 80)
+          .map((l) => "+ " + l)
+          .join("\n");
+      } else {
+        const resultText =
+          typeof result === "string"
+            ? result
+            : result && result.raw
+              ? String(result.raw)
+              : "";
+        if (resultText && (/^\+|^\-|@@/m.test(resultText) || resultText.length < 4000)) {
+          preview = resultText.slice(0, 6000);
+        }
+      }
+
+      // 粗略行号：若 old_string 很短，打开文件时跳到文件开头附近
+      let line = null;
+      if (typeof data.line === "number") line = data.line;
+      else if (typeof data.start_line === "number") line = data.start_line;
+
+      return {
+        oldText: oldText != null ? String(oldText) : undefined,
+        newText: newText != null ? String(newText) : undefined,
+        preview: preview || "",
+        line,
+        canDiff: !!(oldText != null || newText != null || patch),
+      };
+    }
+
     function buildToolActivity(toolCalls) {
       const fileMap = new Map();
       const commands = [];
@@ -448,6 +800,7 @@
         const kind = classifyTool(tc.name);
         const filePath = extractFilePath(tc.name, tc.input);
         const stats = parseChangeStats(tc.name, tc.input, tc.result);
+        const change = extractChangePayload(tc.name, tc.input, tc.result);
         const isRunning = !!tc.isRunning;
 
         if (kind === "command" || (!filePath && kind === "other")) {
@@ -462,7 +815,6 @@
         }
 
         if (!filePath && kind === "search") {
-          const data = parseToolInput(tc.input);
           commands.push({
             id: tc.id,
             kind: "search",
@@ -496,6 +848,7 @@
           stats,
           toolName: tc.name,
           isRunning,
+          change,
         };
 
         if (!existing) {
@@ -503,10 +856,17 @@
           continue;
         }
 
-        if (ACTION_PRIORITY[actionKind] > ACTION_PRIORITY[existing.kind]) {
-          fileMap.set(normalizedPath, { ...entry, isRunning: existing.isRunning || isRunning });
+        // 合并同路径：保留更高优先级动作，并拼上最新 diff
+        if (ACTION_PRIORITY[actionKind] >= ACTION_PRIORITY[existing.kind]) {
+          fileMap.set(normalizedPath, {
+            ...entry,
+            isRunning: existing.isRunning || isRunning,
+            change: change.preview ? change : existing.change,
+          });
         } else if (isRunning) {
           existing.isRunning = true;
+        } else if (change.preview && !existing.change?.preview) {
+          existing.change = change;
         }
       }
 
@@ -589,6 +949,9 @@
     }
 
     function renderFileChangeItem(file) {
+      const wrap = document.createElement("div");
+      wrap.className = "file-change-wrap";
+
       const row = document.createElement("div");
       row.className = "file-change-item clickable";
 
@@ -601,11 +964,21 @@
               ? "search"
               : "read";
       const badgeText =
-        file.kind === "created" ? "+" : file.kind === "modified" ? "M" : file.kind === "search" ? "G" : "R";
+        file.kind === "created"
+          ? "+"
+          : file.kind === "modified"
+            ? "M"
+            : file.kind === "search"
+              ? "G"
+              : "R";
 
       const statsHtml = renderStatsHtml(file.stats);
+      const hasPreview = !!(file.change && file.change.preview);
 
       row.innerHTML =
+        '<span class="file-chevron">' +
+        (hasPreview ? "▶" : "") +
+        "</span>" +
         '<span class="file-badge ' +
         badgeClass +
         '">' +
@@ -623,12 +996,64 @@
         "</div>" +
         statsHtml;
 
+      const detail = document.createElement("div");
+      detail.className = "file-change-detail";
+      if (hasPreview) {
+        const pre = document.createElement("pre");
+        pre.className = "file-diff-pre";
+        pre.textContent = file.change.preview;
+        detail.appendChild(pre);
+      }
+      const actions = document.createElement("div");
+      actions.className = "file-change-actions";
+      const openBtn = document.createElement("button");
+      openBtn.type = "button";
+      openBtn.className = "file-action-btn";
+      openBtn.textContent = "Open";
+      openBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        vscode.postMessage({
+          type: "openFile",
+          payload: { path: file.path, line: file.change?.line || undefined },
+        });
+      });
+      actions.appendChild(openBtn);
+      if (file.change?.canDiff || file.kind === "modified" || file.kind === "created") {
+        const diffBtn = document.createElement("button");
+        diffBtn.type = "button";
+        diffBtn.className = "file-action-btn";
+        diffBtn.textContent = "Diff";
+        diffBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          vscode.postMessage({
+            type: "openDiff",
+            payload: {
+              path: file.path,
+              oldText: file.change?.oldText,
+              newText: file.change?.newText,
+              title: file.fileName + " (HxxCode)",
+            },
+          });
+        });
+        actions.appendChild(diffBtn);
+      }
+      detail.appendChild(actions);
+
       row.addEventListener("click", (e) => {
         e.stopPropagation();
-        vscode.postMessage({ type: "openFile", payload: { path: file.path } });
+        if (hasPreview) {
+          wrap.classList.toggle("open");
+        } else {
+          vscode.postMessage({
+            type: "openFile",
+            payload: { path: file.path, line: file.change?.line || undefined },
+          });
+        }
       });
 
-      return row;
+      wrap.appendChild(row);
+      wrap.appendChild(detail);
+      return wrap;
     }
 
     function renderCommandItem(cmd) {
@@ -670,17 +1095,32 @@
     // ── Permission panel ──
 
     function showPermissionRequest(payload) {
+      if (!payload?.id) return;
       pendingPermissionId = payload.id;
-      const actionLabel = ACTION_LABELS[payload.action] || payload.action;
-      permissionTitle.textContent = "需要确认：" + actionLabel;
-      permissionDetail.textContent = (payload.resources || []).join("\n") || "未知范围";
-      permissionPanel?.classList.remove("hidden");
+      const actionLabel = ACTION_LABELS[payload.action] || payload.action || "Permission";
+      if (permissionTitle) permissionTitle.textContent = actionLabel;
+      if (permissionDetail) {
+        permissionDetail.textContent =
+          (payload.resources || []).join("\n") || "No resource specified";
+      }
+      if (permissionPanel) {
+        permissionPanel.classList.remove("hidden");
+        permissionPanel.style.display = "block";
+      }
+      try {
+        permissionPanel?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+      } catch {
+        // ignore
+      }
       scrollToBottom();
     }
 
     function hidePermissionRequest() {
       pendingPermissionId = null;
-      permissionPanel?.classList.add("hidden");
+      if (permissionPanel) {
+        permissionPanel.classList.add("hidden");
+        permissionPanel.style.display = "";
+      }
     }
 
     function replyPermission(reply) {
@@ -699,6 +1139,7 @@
       if (!lastMsg || lastMsg.role !== "assistant") return;
       lastMsg.text = accumulatedText;
       renderMessages();
+      updateActivityBar();
     }
 
     function updateToolStart(_sessionId, toolCallId, toolName, toolInput) {
@@ -710,7 +1151,13 @@
         input: toolInput,
         isRunning: true,
       });
+      state.activity = formatToolStepLabel({
+        name: toolName,
+        input: toolInput,
+        isRunning: true,
+      });
       renderMessages();
+      updateActivityBar();
     }
 
     function updateToolEnd(_sessionId, toolCallId, toolResult) {
@@ -721,7 +1168,9 @@
         tc.isRunning = false;
         tc.result = toolResult;
       }
+      if (state.isStreaming) state.activity = "Working…";
       renderMessages();
+      updateActivityBar();
     }
 
     // ── Status bar ──
@@ -732,7 +1181,10 @@
         statusLeft.textContent = activeProvider ? activeProvider.name : "未连接";
       }
       if (statusRight) {
-        statusRight.textContent = state.activeModel || "未选择模型";
+        const parts = [];
+        if (state.activeModel) parts.push(state.activeModel);
+        if (state.activeVisionModel) parts.push("识图:" + state.activeVisionModel);
+        statusRight.textContent = parts.join(" · ") || "未选择模型";
       }
     }
 
@@ -829,8 +1281,11 @@
 
     function autoResizeInput() {
       if (!inputBox) return;
+      const minH = 56;
+      const maxH = 160;
       inputBox.style.height = "auto";
-      inputBox.style.height = Math.min(inputBox.scrollHeight, 120) + "px";
+      inputBox.style.height =
+        Math.min(Math.max(inputBox.scrollHeight, minH), maxH) + "px";
     }
 
     function updateInputState() {
@@ -838,20 +1293,21 @@
       if (state.isStreaming) {
         sendBtn.innerHTML = STOP_ICON;
         sendBtn.className = "send-btn cancel";
-        sendBtn.title = "取消";
+        sendBtn.title = "Stop";
         inputBox.disabled = true;
         if (attachBtn) attachBtn.disabled = true;
         if (fileInput) fileInput.disabled = true;
       } else {
         sendBtn.innerHTML = SEND_ICON;
         sendBtn.className = "send-btn";
-        sendBtn.title = "发送";
+        sendBtn.title = "Send";
         inputBox.disabled = false;
         if (attachBtn) attachBtn.disabled = false;
         if (fileInput) fileInput.disabled = false;
         inputBox.focus();
       }
       renderPendingAttachments();
+      updateActivityBar();
     }
 
     function showToast(message) {
@@ -1110,8 +1566,12 @@
       vscode.postMessage({ type: "createSession" });
     });
 
-    // Model chip
+    // Model / vision chips share the same popover
     modelChip?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      togglePopover();
+    });
+    visionChip?.addEventListener("click", (e) => {
       e.stopPropagation();
       togglePopover();
     });
@@ -1234,6 +1694,9 @@
           break;
         case "permissionRequest":
           showPermissionRequest(msg.payload);
+          break;
+        case "permissionClear":
+          hidePermissionRequest();
           break;
         case "error":
           showToast(msg.payload.message);

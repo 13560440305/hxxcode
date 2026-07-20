@@ -103,14 +103,18 @@ export class SettingsPanel {
       }
 
       case "setActive": {
-        const { providerId, model } = message.payload as {
+        const { providerId, model, visionModel } = message.payload as {
           providerId: string;
           model: string;
+          visionModel?: string;
         };
         if (this.opencodeManager) {
           await this.opencodeManager.switchModel(providerId, model);
         } else {
           await this.providerStore.setActive(providerId, model);
+        }
+        if (visionModel) {
+          await this.providerStore.setActiveVision(providerId, visionModel);
         }
         this.postState();
         ChatViewProvider.notifyProviderChanged();
@@ -127,12 +131,15 @@ export class SettingsPanel {
 
   private postState(savedProviderId?: string): void {
     const { provider, model } = this.providerStore.getActive();
+    const vision = this.providerStore.getActiveVision();
     this.panel.webview.postMessage({
       type: "state",
       payload: {
         providers: this.providerStore.list(),
         activeProviderId: provider?.id ?? null,
         activeModel: model,
+        activeVisionProviderId: vision.provider?.id ?? null,
+        activeVisionModel: vision.model,
         ...(savedProviderId ? { savedProviderId } : {}),
       },
     });
@@ -410,6 +417,10 @@ export class SettingsPanel {
     border-radius: 20px;
     font-size: 11px;
   }
+  .model-tag.vision {
+    border-color: color-mix(in srgb, #c9a227 40%, var(--border-subtle));
+    background: color-mix(in srgb, #c9a227 14%, var(--bg-input));
+  }
   .model-tag .x {
     width: 14px; height: 14px;
     border-radius: 50%;
@@ -570,13 +581,20 @@ export class SettingsPanel {
         </div>
 
         <div class="section-title">
-          模型列表
-          <span class="hint">点击 × 删除；点 + 添加或自动拉取</span>
+          对话 / 编程模型
+          <span class="hint">给 Agent 改代码用；点击 × 删除</span>
         </div>
         <div class="model-chips-editor" id="modelsEditor"></div>
+
+        <div class="section-title" style="margin-top:14px">
+          识图模型
+          <span class="hint">仅用于图片识别；有默认值，可在聊天框切换</span>
+        </div>
+        <div class="model-chips-editor" id="visionModelsEditor"></div>
+
         <div class="fetch-row">
-          <button class="btn btn-ghost" id="fetchModelsBtn">↻ 自动拉取模型列表</button>
-          <span class="hint-text">通过 /v1/models 接口获取该供应商支持的全部模型</span>
+          <button class="btn btn-ghost" id="fetchModelsBtn">↻ 自动拉取并分类</button>
+          <span class="hint-text">拉取后按模型名自动分到「对话」或「识图」；可再手动调整</span>
         </div>
 
         <div class="bottom-actions">
@@ -597,10 +615,12 @@ export class SettingsPanel {
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
 
-  let state = { providers: [], activeProviderId: null, activeModel: null };
+  let state = { providers: [], activeProviderId: null, activeModel: null, activeVisionModel: null, activeVisionProviderId: null };
   let currentEditId = null;
   let pendingModels = [];
+  let pendingVisionModels = [];
   let saving = false;
+  let modelInputKind = "text"; // "text" | "vision"
 
   function setSaveButtonsDisabled(disabled) {
     const btn1 = $("saveBtn");
@@ -695,6 +715,7 @@ export class SettingsPanel {
     $("editApiKey").value = "";
     // 获取已有 key 以便编辑（通过 postMessage 请求）
     pendingModels = [...(p.models || [])];
+    pendingVisionModels = [...(p.visionModels || [])];
     renderModelChips();
   }
 
@@ -708,9 +729,15 @@ export class SettingsPanel {
     $("editorForm").style.display = "block";
   }
 
-  // ── Model chips ──
+  // ── Model chips（对话 + 识图 两类）──
 
   let modelInputOpen = false;
+
+  function isVisionName(name) {
+    const n = String(name || "");
+    if (/^glm-\d+(\.\d+)?$/i.test(n)) return false;
+    return /vision|vl|4v|5v|\.6v|gpt-4o|claude-3|gemini/i.test(n);
+  }
 
   function commitModelInput() {
     const input = $("modelNameInput");
@@ -721,8 +748,15 @@ export class SettingsPanel {
       return;
     }
     const lowerName = name.toLowerCase();
-    if (!pendingModels.some((m) => m.toLowerCase() === lowerName)) {
-      pendingModels.push(name);
+    const list = modelInputKind === "vision" ? pendingVisionModels : pendingModels;
+    if (!list.some((m) => m.toLowerCase() === lowerName)) {
+      list.push(name);
+    }
+    // 互斥：同一模型不要两边都有
+    if (modelInputKind === "vision") {
+      pendingModels = pendingModels.filter((m) => m.toLowerCase() !== lowerName);
+    } else {
+      pendingVisionModels = pendingVisionModels.filter((m) => m.toLowerCase() !== lowerName);
     }
     modelInputOpen = false;
     renderModelChips();
@@ -733,14 +767,15 @@ export class SettingsPanel {
     renderModelChips();
   }
 
-  function openModelInput() {
+  function openModelInput(kind) {
+    modelInputKind = kind === "vision" ? "vision" : "text";
     modelInputOpen = true;
     renderModelChips();
     const input = $("modelNameInput");
     input?.focus();
   }
 
-  function appendModelAddInline(editor) {
+  function appendModelAddInline(editor, kind) {
     const row = document.createElement("div");
     row.className = "model-add-inline";
     row.id = "modelAddRow";
@@ -748,7 +783,7 @@ export class SettingsPanel {
     const input = document.createElement("input");
     input.type = "text";
     input.id = "modelNameInput";
-    input.placeholder = "输入模型名称，Enter 确认";
+    input.placeholder = kind === "vision" ? "识图模型名，Enter 确认" : "对话模型名，Enter 确认";
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
@@ -776,33 +811,41 @@ export class SettingsPanel {
     editor.appendChild(row);
   }
 
-  function renderModelChips() {
-    const editor = $("modelsEditor");
+  function renderChipList(editorId, list, kind) {
+    const editor = $(editorId);
     if (!editor) return;
     editor.innerHTML = "";
-    for (const m of pendingModels) {
+    for (const m of list) {
       const tag = document.createElement("div");
-      tag.className = "model-tag";
+      tag.className = "model-tag" + (kind === "vision" ? " vision" : "");
       tag.innerHTML = escapeHtml(m) + ' <span class="x" data-model="' + escapeAttr(m) + '">×</span>';
       tag.querySelector(".x").addEventListener("click", () => {
-        pendingModels = pendingModels.filter(mo => mo !== m);
+        if (kind === "vision") {
+          pendingVisionModels = pendingVisionModels.filter((mo) => mo !== m);
+        } else {
+          pendingModels = pendingModels.filter((mo) => mo !== m);
+        }
         renderModelChips();
       });
       editor.appendChild(tag);
     }
 
-    if (modelInputOpen) {
-      appendModelAddInline(editor);
+    if (modelInputOpen && modelInputKind === kind) {
+      appendModelAddInline(editor, kind);
       return;
     }
 
     const addBtn = document.createElement("button");
     addBtn.type = "button";
     addBtn.className = "model-tag-add";
-    addBtn.id = "addModelBtn";
-    addBtn.textContent = "+ 添加模型";
-    addBtn.addEventListener("click", openModelInput);
+    addBtn.textContent = kind === "vision" ? "+ 添加识图模型" : "+ 添加对话模型";
+    addBtn.addEventListener("click", () => openModelInput(kind));
     editor.appendChild(addBtn);
+  }
+
+  function renderModelChips() {
+    renderChipList("modelsEditor", pendingModels, "text");
+    renderChipList("visionModelsEditor", pendingVisionModels, "vision");
   }
 
   // ── Utilities ──
@@ -877,6 +920,7 @@ export class SettingsPanel {
         kind: $("editKind").value,
         baseURL: $("editBaseURL").value.trim(),
         models: pendingModels,
+        visionModels: pendingVisionModels,
       },
       apiKey: $("editApiKey").value,
     };
@@ -887,6 +931,7 @@ export class SettingsPanel {
   function startNewProvider() {
     currentEditId = "new-" + Date.now().toString(36);
     pendingModels = [];
+    pendingVisionModels = [];
     modelInputOpen = false;
     showEditForm();
     $("editTitle").textContent = "新建供应商";
@@ -917,9 +962,14 @@ export class SettingsPanel {
   function setActive() {
     if (!currentEditId || currentEditId.startsWith("new-")) return;
     const models = pendingModels.length > 0 ? pendingModels : (state.providers.find(p => p.id === currentEditId)?.models || []);
+    const visionModels = pendingVisionModels.length > 0 ? pendingVisionModels : (state.providers.find(p => p.id === currentEditId)?.visionModels || []);
     vscode.postMessage({
       type: "setActive",
-      payload: { providerId: currentEditId, model: models[0] || "" },
+      payload: {
+        providerId: currentEditId,
+        model: models[0] || "",
+        visionModel: visionModels[0] || "",
+      },
     });
   }
 
@@ -964,15 +1014,21 @@ export class SettingsPanel {
       renderState(payload);
     }
     if (type === "modelsFetched") {
-      pendingModels = payload.models;
+      const all = payload.models || [];
+      pendingModels = [];
+      pendingVisionModels = [];
+      for (const m of all) {
+        if (isVisionName(m)) pendingVisionModels.push(m);
+        else pendingModels.push(m);
+      }
       modelInputOpen = false;
       renderModelChips();
-      $("fetchModelsBtn").textContent = "↻ 自动拉取模型列表";
+      $("fetchModelsBtn").textContent = "↻ 自动拉取并分类";
       $("fetchModelsBtn").disabled = false;
     }
     if (type === "error") {
       alert(payload.message);
-      $("fetchModelsBtn").textContent = "↻ 自动拉取模型列表";
+      $("fetchModelsBtn").textContent = "↻ 自动拉取并分类";
       $("fetchModelsBtn").disabled = false;
     }
   });

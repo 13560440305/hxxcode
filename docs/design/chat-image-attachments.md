@@ -15,32 +15,34 @@
 
 ## 现状与关键缺口
 
-当前全链路纯文本：
+统一发送流程（识图与 Agent 解耦）：
 
 ```
-webview send({ text }) → ChatMessage.text → SDK { prompt: { text } } → OpenCode
+有图？ → 直连 Vision /chat/completions 识图成文
+       → 再把「用户文字 + 识图结果」纯文本交给 opencode-ai/cli Agent
+无图？ → 直接把用户文字交给 Agent
 ```
+
+图片**不再**作为 file parts 进入 OpenCode，避免 Vision SSE/权限兜底干扰多步工具循环。
 
 关键文件：
 
 - UI：`src/media/chat-webview.js` + `src/chatViewProvider.ts`
-- 发送：`src/opencodeManager.ts`
-- SDK 压成纯文本：`src/lib/@opencode-ai/sdk/index.mjs`
-- 供应商：`src/providerStore.ts`（缺 `modalities.input` 含 `image` 时 OpenCode 会剥掉图片）
+- 识图：`src/visionRecognize.ts`（直连供应商，不经 CLI）
+- Agent：`src/opencodeManager.ts` + `src/lib/@opencode-ai/sdk/index.mjs`
+- 供应商：`src/providerStore.ts`（`modelSupportsVision` / 自动挑选 glm-4.6v 等）
 
 ```mermaid
 flowchart LR
   pasteImg[Paste_image] --> preview[Composer_Preview]
   upload[Upload_image_or_text] --> preview
-  preview --> sendMsg[sendMessage_text_plus_attachments]
+  preview --> sendMsg[sendMessage]
   sendMsg --> host[ChatViewProvider]
-  host --> saveFiles[Save_attachments]
-  host --> build[Build_prompt_parts]
-  build --> imgParts[Image_file_parts]
-  build --> textParts[Text_string_in_prompt]
-  imgParts --> sdk[SDK]
-  textParts --> sdk
-  sdk --> oc[OpenCode]
+  host --> hasImg{Has_images?}
+  hasImg -->|yes| vision[Direct_Vision_API]
+  vision --> agentText[Text_for_Agent]
+  hasImg -->|no| agentText
+  agentText --> oc[opencode_CLI_Agent]
 ```
 
 ## 分类规则、黑名单与体积限制

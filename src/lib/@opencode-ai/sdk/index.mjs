@@ -592,46 +592,568 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** 从 /message 列表取「本次 prompt 之后」最新完成的 assistant 文本 */
+/** 兼容多种 OpenCode / lildax 权限列表响应形状 */
+function extractPermissionList(json) {
+  const raw = json?.data ?? json;
+  if (Array.isArray(raw)) return raw;
+  if (!raw || typeof raw !== "object") return [];
+  for (const key of ["permissions", "requests", "items", "pending"]) {
+    if (Array.isArray(raw[key])) return raw[key];
+  }
+  // id → request 的 map
+  const vals = Object.values(raw);
+  if (
+    vals.length > 0 &&
+    vals.every(
+      (v) =>
+        v &&
+        typeof v === "object" &&
+        (v.id || v.requestID || v.permission || v.action || v.type)
+    )
+  ) {
+    return vals;
+  }
+  if (raw.id || raw.requestID || raw.permissionID) return [raw];
+  return [];
+}
+
+/** 本轮是否真正结束（tool-calls 只是中间步，不算完） */
+function isAssistantTurnComplete(msg) {
+  if (!msg) return false;
+  const finish = msg.finish ?? null;
+  if (finish === "tool-calls" || finish === "tool_calls") return false;
+  if (
+    finish === "stop" ||
+    finish === "end_turn" ||
+    finish === "stop-sequence" ||
+    finish === "error" ||
+    finish === "length" ||
+    finish === "cancelled" ||
+    finish === "canceled"
+  ) {
+    return true;
+  }
+  // 有 completed 时间且无中间 finish
+  if (msg._completed && finish == null) return true;
+  if (msg.time?.completed && finish == null) return true;
+  return false;
+}
+
+/** 判断消息数组是否新→旧（lildax 常见） */
+function isMessagesNewestFirst(messages) {
+  if (!Array.isArray(messages) || messages.length < 2) return true;
+  const a = Number(messages[0]?.time?.created ?? 0);
+  const b = Number(messages[messages.length - 1]?.time?.created ?? 0);
+  if (a && b) return a >= b;
+  return true;
+}
+
+/** 统一成 { id, action, resources, sessionID } */
+function normalizePermissionRequest(req) {
+  if (!req || typeof req !== "object") return null;
+  const id = req.id ?? req.requestID ?? req.permissionID ?? null;
+  if (!id) return null;
+  const action =
+    req.action ?? req.permission ?? req.type ?? req.name ?? "unknown";
+  let resources = req.resources ?? req.patterns ?? null;
+  if (!resources && req.pattern) resources = [req.pattern];
+  if (!resources && req.resource) resources = [req.resource];
+  if (!Array.isArray(resources)) resources = resources ? [String(resources)] : [];
+  return {
+    ...req,
+    id: String(id),
+    action: String(action),
+    resources: resources.map(String),
+    sessionID: req.sessionID ?? req.sessionId ?? req.session_id,
+  };
+}
+
+function isPermissionEvent(ev) {
+  const t = String(ev?.type ?? "");
+  return (
+    t === "permission.asked" ||
+    t === "permission.updated" ||
+    t === "permission.requested" ||
+    t === "session.permission.asked" ||
+    t === "session.next.permission.asked" ||
+    /permission\.(asked|updated|requested)/i.test(t)
+  );
+}
+
+function permissionFromEvent(ev) {
+  const data = ev?.data ?? ev?.properties ?? ev;
+  return normalizePermissionRequest(data);
+}
+
+/** 兼容 flat / {info,parts} 两种消息列表 */
+function normalizeMessageList(json) {
+  const raw = json?.data ?? json;
+  const arr = Array.isArray(raw)
+    ? raw
+    : Array.isArray(raw?.messages)
+      ? raw.messages
+      : Array.isArray(raw?.items)
+        ? raw.items
+        : [];
+  return arr.map((m) => {
+    if (!m || typeof m !== "object") return null;
+    if (m.info || m.parts) {
+      const info = m.info ?? m;
+      const parts = Array.isArray(m.parts)
+        ? m.parts
+        : Array.isArray(m.content)
+          ? m.content
+          : [];
+      const role = info.role ?? info.type ?? m.role ?? m.type;
+      const texts = parts
+        .filter((p) => p && (p.type === "text" || typeof p.text === "string"))
+        .map((p) => p.text)
+        .filter((t) => typeof t === "string");
+      return {
+        id: info.id ?? m.id,
+        type: role === "assistant" || role === "Assistant" ? "assistant" : role,
+        finish: info.finish ?? m.finish ?? info.time?.finish,
+        time: info.time ?? m.time ?? {},
+        content: parts,
+        _text: texts.join("\n").trim(),
+        _completed: !!(
+          info.time?.completed ||
+          m.time?.completed ||
+          info.finish != null ||
+          m.finish != null ||
+          info.status === "completed" ||
+          m.completed === true
+        ),
+      };
+    }
+    const role = m.type ?? m.role;
+    const content = Array.isArray(m.content)
+      ? m.content
+      : Array.isArray(m.parts)
+        ? m.parts
+        : [];
+    const texts = content
+      .filter((c) => c && c.type === "text" && typeof c.text === "string")
+      .map((c) => c.text);
+    return {
+      id: m.id,
+      type: role === "assistant" || role === "Assistant" ? "assistant" : role,
+      finish: m.finish,
+      time: m.time ?? {},
+      content,
+      _text: texts.join("\n").trim(),
+      _completed: !!(
+        m.time?.completed ||
+        m.finish != null ||
+        m.status === "completed" ||
+        m.completed === true
+      ),
+    };
+  }).filter(Boolean);
+}
+
+/** 从 /message 列表取「本次 prompt 之后」最新 assistant（优先已完成；否则返回进行中的正文用于软恢复） */
 async function fetchLatestAssistantText(
   api,
   sessionId,
   signal,
-  { afterMessageId = null, afterMs = 0 } = {}
+  { afterMessageId = null, afterMs = 0, allowIncomplete = false } = {}
 ) {
   const res = await api(`/session/${sessionId}/message`, { signal });
   if (!res.ok) return null;
   const json = await res.json().catch(() => ({}));
-  const messages = json?.data ?? json;
-  if (!Array.isArray(messages)) return null;
+  const messages = normalizeMessageList(json);
+  if (!messages.length) return null;
 
-  let minIndex = 0;
-  if (afterMessageId) {
-    const idx = messages.findIndex((m) => m?.id === afterMessageId);
-    if (idx >= 0) minIndex = idx + 1;
-  }
+  const newestFirst = isMessagesNewestFirst(messages);
+  const promptIdx = afterMessageId
+    ? messages.findIndex((m) => m?.id === afterMessageId)
+    : -1;
 
-  for (let i = messages.length - 1; i >= minIndex; i--) {
+  const isAfterPrompt = (idx, created) => {
+    if (afterMs && created && created < afterMs) return false;
+    if (promptIdx < 0) return true;
+    // 新→旧：prompt 之后的消息下标更小；旧→新：下标更大
+    if (newestFirst) return idx < promptIdx;
+    return idx > promptIdx;
+  };
+
+  let incompleteHit = null;
+  // 始终从「最新」往旧扫，避免先命中中间的 tool-calls 就误判结束
+  const order = newestFirst
+    ? messages.map((m, i) => i)
+    : messages.map((m, i) => i).reverse();
+
+  for (const i of order) {
     const msg = messages[i];
     if (msg?.type !== "assistant") continue;
-    if (!msg.time?.completed && msg.finish == null) continue;
     const created = Number(msg.time?.created ?? 0);
-    // 必须是本次 prompt 之后创建的 assistant，避免把上一轮结果当成新回复
-    if (afterMs && created && created < afterMs) continue;
-    const texts = (msg.content ?? [])
-      .filter((c) => c?.type === "text" && typeof c.text === "string")
-      .map((c) => c.text);
-    const text = texts.join("\n").trim();
-    if (text) {
+    if (!isAfterPrompt(i, created)) continue;
+
+    const text =
+      msg._text ||
+      (msg.content ?? [])
+        .filter((c) => c?.type === "text" && typeof c.text === "string")
+        .map((c) => c.text)
+        .join("\n")
+        .trim();
+
+    if (isAssistantTurnComplete(msg)) {
       return {
-        text,
+        text: text || "",
         messageId: msg.id,
         finish: msg.finish ?? "stop",
         created,
+        completed: true,
+      };
+    }
+    if (allowIncomplete && !incompleteHit) {
+      incompleteHit = {
+        text: text || "",
+        messageId: msg.id,
+        finish: msg.finish || "stop",
+        created,
+        completed: false,
       };
     }
   }
-  return null;
+  return incompleteHit;
+}
+
+/**
+ * POST /session/{id}/wait — 等到 agent loop idle（OpenAPI: 204）。
+ * 用作完成/取消确认的双保险通道。
+ */
+async function waitForSessionIdle(api, sessionId, signal, log, timeoutMs = 600_000) {
+  const timeoutSignal =
+    typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(timeoutMs)
+      : null;
+  const waitSignal =
+    timeoutSignal && typeof AbortSignal.any === "function"
+      ? AbortSignal.any([signal, timeoutSignal].filter(Boolean))
+      : signal;
+  log(`POST /session/${sessionId}/wait（timeout=${Math.round(timeoutMs / 1000)}s）…`);
+  const res = await api(`/session/${sessionId}/wait`, {
+    method: "POST",
+    signal: waitSignal,
+  });
+  if (res.status === 204 || res.ok) {
+    log(`wait 确认 idle: status=${res.status}`);
+    return true;
+  }
+  const body = await res.text().catch(() => "");
+  // lildax 上 wait 可能恒 503：明确标不可用，交由 /message 主路径
+  if (res.status === 503 || res.status === 404 || res.status === 501) {
+    const err = new Error(`wait 不可用 (${res.status}): ${body}`);
+    err.code = "WAIT_UNAVAILABLE";
+    throw err;
+  }
+  throw new Error(`wait 失败 (${res.status}): ${body}`);
+}
+
+/** 主动查询 session 是否 idle（不依赖 SSE） */
+async function querySessionIdle(api, sessionId, signal) {
+  const paths = [
+    `/session/${sessionId}/status`,
+    `/session/status`,
+  ];
+  for (const path of paths) {
+    try {
+      const res = await api(path, { signal });
+      if (!res.ok) continue;
+      const json = await res.json().catch(() => ({}));
+      const data = json?.data ?? json;
+      if (!data || typeof data !== "object") continue;
+      if (data.busy === false) return true;
+      if (data.idle === true) return true;
+      if (data.status === "idle" || data.type === "idle" || data.state === "idle") {
+        return true;
+      }
+      const one = data[sessionId];
+      if (one && typeof one === "object") {
+        if (one.busy === false) return true;
+        if (one.idle === true) return true;
+        if (one.status === "idle" || one.type === "idle" || one.state === "idle") {
+          return true;
+        }
+      }
+    } catch {
+      // try next
+    }
+  }
+  return false;
+}
+
+/**
+ * 主完成判定：只向 lildax 主动查询。
+ * - 主路径：定时 GET /message（completed/finish）
+ * - 双保险：并行 POST /wait（idle）
+ * - 辅助：GET status（idle）
+ * SSE 仅推送 UI 进度，绝不参与完成判定。
+ */
+async function* completePromptByPollAndWait({
+  api,
+  sessionId,
+  signal,
+  log,
+  messageId,
+  afterMs = 0,
+  pollIntervalMs = 1_000,
+  completionTimeoutMs = 600_000,
+  sseResponse = null,
+  ssePermissionInbox = null,
+}) {
+  const t0 = Date.now();
+  const eventQueue = [];
+  let waitResolved = false;
+  let waitFailed = null;
+  const waitAbort = new AbortController();
+  const waitSignal =
+    typeof AbortSignal.any === "function"
+      ? AbortSignal.any([signal, waitAbort.signal].filter(Boolean))
+      : signal;
+
+  const waitTask = waitForSessionIdle(
+    api,
+    sessionId,
+    waitSignal,
+    log,
+    completionTimeoutMs
+  )
+    .then(() => {
+      waitResolved = true;
+    })
+    .catch((err) => {
+      if (
+        signal?.aborted ||
+        waitAbort.signal.aborted ||
+        isStreamTerminationError(err)
+      ) {
+        return;
+      }
+      waitFailed = err;
+      // lildax 上 wait 常 503（Session wait is not available yet），属预期，不刷错误感日志
+      if (err?.code === "WAIT_UNAVAILABLE") {
+        log(`wait 不可用，改用 /message 轮询完成判定`);
+      } else {
+        log(`wait 通道异常（仍以 /message 轮询为准）: ${err?.message ?? err}`);
+      }
+    });
+
+  // SSE 可选：只往队列塞进度事件，完成判定不读这些标志
+  if (sseResponse) {
+    void (async () => {
+      try {
+        for await (const ev of parseSessionEvents(
+          sseResponse,
+          signal,
+          log,
+          completionTimeoutMs,
+          { messageId, forceActive: true }
+        )) {
+          if (isPermissionEvent(ev)) {
+            const perm = permissionFromEvent(ev);
+            if (perm && Array.isArray(ssePermissionInbox)) {
+              ssePermissionInbox.push(perm);
+            }
+          }
+          // 完成类事件不进入 UI 队列，避免误触发 finish
+          if (
+            ev?.type === "session.next.step.ended" ||
+            ev?.type === "session.next.step.failed"
+          ) {
+            continue;
+          }
+          eventQueue.push(ev);
+        }
+      } catch (err) {
+        if (!signal?.aborted && !isStreamTerminationError(err)) {
+          log(`SSE 进度通道结束: ${err?.message ?? err}`);
+        }
+      }
+    })();
+  }
+
+  let lastEmittedText = "";
+
+  const flushProgressOnly = function* () {
+    while (eventQueue.length) {
+      const ev = eventQueue.shift();
+      const t = ev?.type;
+      if (t === "session.next.text.delta") {
+        const delta = ev?.data?.delta ?? ev?.data?.text;
+        if (typeof delta === "string" && delta.length > 0) {
+          lastEmittedText += delta;
+        }
+      }
+      if (t === "session.next.text.ended") {
+        const text = ev?.data?.text;
+        if (typeof text === "string" && text.trim() && !lastEmittedText) {
+          lastEmittedText = text;
+        }
+      }
+      yield ev;
+    }
+  };
+
+  const emitFinalFromHit = function* (hit, source) {
+    log(
+      `完成确认(${source}): len=${(hit?.text ?? "").length} messageID=${hit?.messageId ?? "?"} finish=${hit?.finish ?? "stop"}`
+    );
+    try {
+      waitAbort.abort();
+    } catch {
+      // ignore
+    }
+    if (hit?.text && hit.text !== lastEmittedText) {
+      let delta = hit.text;
+      if (lastEmittedText && hit.text.startsWith(lastEmittedText)) {
+        delta = hit.text.slice(lastEmittedText.length);
+      } else if (lastEmittedText) {
+        delta = "";
+      }
+      if (delta) {
+        yield {
+          type: "session.next.text.delta",
+          data: { sessionID: sessionId, delta },
+        };
+        lastEmittedText = hit.text;
+      } else if (!lastEmittedText && hit.text) {
+        yield {
+          type: "session.next.text.delta",
+          data: { sessionID: sessionId, delta: hit.text },
+        };
+        lastEmittedText = hit.text;
+      }
+    }
+    yield {
+      type: "session.next.step.ended",
+      data: {
+        sessionID: sessionId,
+        // 给 UI 的终态一律用 stop，避免 tool-calls 等中间 finish 无法触发 StreamEvent.finish
+        finish: "stop",
+        assistantMessageID: hit?.messageId,
+        rawFinish: hit?.finish || "stop",
+      },
+    };
+  };
+
+  log(
+    `开始完成判定（主动查询 lildax：/message + /wait + status；SSE 仅进度） poll=${pollIntervalMs}ms timeout=${Math.round(completionTimeoutMs / 1000)}s afterMessageId=${messageId ?? "?"} afterMs=${afterMs}`
+  );
+
+  while (!signal?.aborted) {
+    // 1) 可选：刷 SSE 进度到 UI（与完成无关）
+    yield* flushProgressOnly();
+
+    // 2) 主路径：查询 /message
+    try {
+      const hit = await fetchLatestAssistantText(api, sessionId, signal, {
+        afterMessageId: messageId,
+        afterMs,
+        allowIncomplete: true,
+      });
+      if (hit?.text && hit.text !== lastEmittedText) {
+        let delta = hit.text;
+        if (lastEmittedText && hit.text.startsWith(lastEmittedText)) {
+          delta = hit.text.slice(lastEmittedText.length);
+        } else if (lastEmittedText) {
+          delta = "";
+        }
+        if (delta) {
+          yield {
+            type: "session.next.text.delta",
+            data: { sessionID: sessionId, delta },
+          };
+          lastEmittedText = hit.text;
+        }
+      }
+      if (hit?.completed) {
+        yield* emitFinalFromHit(hit, "GET /message completed");
+        await waitTask.catch(() => {});
+        return;
+      }
+    } catch (err) {
+      if (signal?.aborted || isStreamTerminationError(err)) return;
+      log(`轮询 /message 出错: ${err?.message ?? err}`);
+    }
+
+    // 3) 双保险：wait 已返回 idle
+    if (waitResolved) {
+      const finalHit = await fetchLatestAssistantText(api, sessionId, signal, {
+        afterMessageId: messageId,
+        afterMs,
+        allowIncomplete: true,
+      }).catch(() => null);
+      yield* emitFinalFromHit(
+        finalHit || {
+          text: lastEmittedText,
+          finish: "stop",
+          completed: true,
+        },
+        "POST /wait idle"
+      );
+      return;
+    }
+
+    // 4) 辅助：status idle 仅在 message 已最终完成时采信（wait 503 时禁止靠 status 软成功）
+    try {
+      const idle = await querySessionIdle(api, sessionId, signal);
+      if (idle) {
+        const finalHit = await fetchLatestAssistantText(api, sessionId, signal, {
+          afterMessageId: messageId,
+          afterMs,
+          allowIncomplete: true,
+        }).catch(() => null);
+        if (finalHit?.completed) {
+          yield* emitFinalFromHit(
+            finalHit,
+            "GET status idle + message completed"
+          );
+          await waitTask.catch(() => {});
+          return;
+        }
+      }
+    } catch (err) {
+      if (!signal?.aborted) {
+        log(`查询 status 出错: ${err?.message ?? err}`);
+      }
+    }
+
+    if (Date.now() - t0 > completionTimeoutMs) {
+      // 设计 §7.2：轮询超时且 wait 未确认 → failed。
+      // wait 不可用（503）时仍须以 /message 最终 finish 为准；超时一律 failed。
+      if (!waitResolved) {
+        const hint =
+          waitFailed?.code === "WAIT_UNAVAILABLE"
+            ? "（wait 通道不可用，依赖 /message 未在限时内看到最终 finish）"
+            : "";
+        throw new Error(
+          `轮询消息超时且 wait 未确认 idle${hint}：Agent 未在限时内完成。请重启 HxxCode Server 后新建会话重试。`
+        );
+      }
+      const finalHit = await fetchLatestAssistantText(api, sessionId, signal, {
+        afterMessageId: messageId,
+        afterMs,
+        allowIncomplete: true,
+      }).catch(() => null);
+      yield* emitFinalFromHit(
+        finalHit || {
+          text: lastEmittedText,
+          finish: "stop",
+          completed: true,
+        },
+        "timeout-after-wait"
+      );
+      await waitTask.catch(() => {});
+      return;
+    }
+
+    await sleep(pollIntervalMs);
+  }
+
+  await waitTask.catch(() => {});
 }
 
 /** SSE 不可用时，轮询消息直到「本次」assistant 完成 */
@@ -643,6 +1165,9 @@ async function* pollSessionMessagesAsEvents({
   messageId,
   afterMs = 0,
   timeoutMs = 90_000,
+  /** 超时前若已有流式正文，不要硬失败，软结束本轮 */
+  allowPartialOnTimeout = false,
+  alreadyHadText = false,
 }) {
   const t0 = Date.now();
   log(
@@ -650,6 +1175,29 @@ async function* pollSessionMessagesAsEvents({
   );
   while (!signal?.aborted) {
     if (Date.now() - t0 > timeoutMs) {
+      if (allowPartialOnTimeout && alreadyHadText) {
+        log("轮询超时，但 SSE 已有部分正文，软结束本轮（不报硬错误）");
+        const partial = await fetchLatestAssistantText(api, sessionId, signal, {
+          afterMessageId: messageId,
+          afterMs,
+          allowIncomplete: true,
+        }).catch(() => null);
+        if (partial && !alreadyHadText) {
+          yield {
+            type: "session.next.text.delta",
+            data: { sessionID: sessionId, delta: partial.text },
+          };
+        }
+        yield {
+          type: "session.next.step.ended",
+          data: {
+            sessionID: sessionId,
+            finish: "stop",
+            softTimeout: true,
+          },
+        };
+        return;
+      }
       throw new Error(
         "轮询消息超时：Agent 未在限时内产出结果。请重启 HxxCode Server 后新建会话。"
       );
@@ -661,17 +1209,19 @@ async function* pollSessionMessagesAsEvents({
       });
       if (hit) {
         log(
-          `轮询命中本次 assistant 文本 len=${hit.text.length} messageID=${hit.messageId ?? "?"}`
+          `轮询命中本次 assistant 文本 len=${hit.text.length} messageID=${hit.messageId ?? "?"} completed=${hit.completed !== false}`
         );
-        yield {
-          type: "session.next.step.started",
-          data: { sessionID: sessionId, assistantMessageID: hit.messageId },
-        };
-        // 只发一次完整文本（delta），避免再发 text.ended 造成重复
-        yield {
-          type: "session.next.text.delta",
-          data: { sessionID: sessionId, delta: hit.text },
-        };
+        // 若 SSE 已推过正文，不要再把完整文本发一遍（会重复）；只发 finish
+        if (!alreadyHadText) {
+          yield {
+            type: "session.next.step.started",
+            data: { sessionID: sessionId, assistantMessageID: hit.messageId },
+          };
+          yield {
+            type: "session.next.text.delta",
+            data: { sessionID: sessionId, delta: hit.text },
+          };
+        }
         yield {
           type: "session.next.step.ended",
           data: {
@@ -691,8 +1241,7 @@ async function* pollSessionMessagesAsEvents({
 }
 
 /**
- * SSE 与消息轮询并行。
- * 复杂识图时常出现：SSE 在 text.started 后提前断开，Agent 仍在跑 —— 此时必须继续轮询 /message。
+ * 消费 SSE；断流后：重连 SSE + 轮询 /message，直到最终完成或软超时。
  */
 async function* mergeSseWithMessagePoll(sseIter, pollOpts) {
   const {
@@ -702,103 +1251,158 @@ async function* mergeSseWithMessagePoll(sseIter, pollOpts) {
     log,
     messageId,
     afterMs = 0,
-    pollTimeoutMs = 180_000,
+    pollTimeoutMs = 300_000,
   } = pollOpts;
   const iter = sseIter[Symbol.asyncIterator]();
-  let stopped = false;
   let sseFinishedClean = false;
-  /** 是否已收到带正文的 delta/ended（text.started 不算） */
   let sawSseTextBody = false;
-  let pollHit = null;
+  let sawToolCall = false;
+  let sawPrompted = false;
 
-  const pollLoop = (async () => {
-    await sleep(2000);
-    while (!stopped && !signal?.aborted) {
-      try {
-        const hit = await fetchLatestAssistantText(api, sessionId, signal, {
-          afterMessageId: messageId,
-          afterMs,
-        });
-        if (hit) {
-          pollHit = hit;
-          log(
-            `并行轮询命中本次结果 len=${hit.text.length} messageID=${hit.messageId ?? "?"}`
-          );
-          try {
-            await iter.return?.();
-          } catch {
-            // ignore
-          }
-          return;
-        }
-      } catch {
-        // ignore transient
-      }
-      await sleep(1500);
+  const track = (ev) => {
+    const t = ev?.type;
+    if (t === "session.next.prompted") sawPrompted = true;
+    if (t === "session.next.text.delta") {
+      const delta = ev?.data?.delta ?? ev?.data?.text;
+      if (typeof delta === "string" && delta.length > 0) sawSseTextBody = true;
     }
-  })();
+    if (t === "session.next.text.ended") {
+      const text = ev?.data?.text;
+      if (typeof text === "string" && text.trim()) sawSseTextBody = true;
+    }
+    if (t === "session.next.tool.called") sawToolCall = true;
+  };
 
   try {
-    while (!stopped && !signal?.aborted) {
+    while (!signal?.aborted) {
       const next = await iter.next();
-      if (pollHit) break;
       if (next.done) {
         log(
-          `SSE 流结束 (clean=${sseFinishedClean}, sawTextBody=${sawSseTextBody}, pollHit=${!!pollHit})`
+          `SSE 流结束 (clean=${sseFinishedClean}, sawTextBody=${sawSseTextBody}, sawTool=${sawToolCall}, prompted=${sawPrompted})`
         );
         break;
       }
-      const t = next.value?.type;
-      if (t === "session.next.text.delta") {
-        const delta = next.value?.data?.delta ?? next.value?.data?.text;
-        if (typeof delta === "string" && delta.length > 0) sawSseTextBody = true;
-      }
-      if (t === "session.next.text.ended") {
-        const text = next.value?.data?.text;
-        if (typeof text === "string" && text.trim()) sawSseTextBody = true;
-      }
+      track(next.value);
       yield next.value;
+      const t = next.value?.type;
       if (t === "session.next.step.failed" || isFinalStepEnded(next.value)) {
         sseFinishedClean = true;
-        stopped = true;
         break;
       }
     }
   } finally {
-    // 仅在已有正文或干净结束时停掉并行轮询；否则留给后面的续轮询
-    if (sseFinishedClean || sawSseTextBody || pollHit) {
-      stopped = true;
+    try {
+      await iter.return?.();
+    } catch {
+      // ignore
     }
-    await pollLoop.catch(() => {});
   }
 
-  if (signal?.aborted) return;
+  if (signal?.aborted || sseFinishedClean) return;
 
-  if (pollHit && !sawSseTextBody) {
-    log(`使用并行轮询结果作为正文 len=${pollHit.text.length}`);
+  const deadline = Date.now() + pollTimeoutMs;
+  log(
+    `SSE 提前结束 (text=${sawSseTextBody}, tool=${sawToolCall}, prompted=${sawPrompted})，进入重连+轮询兜底（最长 ${Math.round(pollTimeoutMs / 1000)}s）…`
+  );
+
+  let reconnectAttempt = 0;
+  while (!signal?.aborted && Date.now() < deadline) {
+    // 1) 先看消息是否已完成
+    try {
+      const hit = await fetchLatestAssistantText(api, sessionId, signal, {
+        afterMessageId: messageId,
+        afterMs,
+      });
+      if (hit) {
+        log(`兜底轮询命中最终结果 len=${hit.text.length}`);
+        if (!sawSseTextBody) {
+          yield {
+            type: "session.next.text.delta",
+            data: { sessionID: sessionId, delta: hit.text },
+          };
+          sawSseTextBody = true;
+        }
+        yield {
+          type: "session.next.step.ended",
+          data: {
+            sessionID: sessionId,
+            finish: hit.finish || "stop",
+            assistantMessageID: hit.messageId,
+          },
+        };
+        return;
+      }
+    } catch (err) {
+      if (signal?.aborted || isStreamTerminationError(err)) return;
+      log(`兜底查消息失败: ${err.message}`);
+    }
+
+    // 2) 重连 SSE，继续收后续 tool / text（forceActive：不再等 prompted）
+    reconnectAttempt++;
+    const remainMs = Math.max(5_000, deadline - Date.now());
+    log(`重连 SSE #${reconnectAttempt}（本段最长 ${Math.round(remainMs / 1000)}s）…`);
+    try {
+      const sseHeaderTimeout = AbortSignal.timeout(8_000);
+      const sseSignal =
+        typeof AbortSignal.any === "function"
+          ? AbortSignal.any([signal, sseHeaderTimeout])
+          : signal;
+      const eventRes = await api(`/session/${sessionId}/event`, {
+        signal: sseSignal,
+        headers: { Accept: "text/event-stream" },
+      });
+      if (eventRes.ok) {
+        let gotFinal = false;
+        for await (const ev of parseSessionEvents(
+          eventRes,
+          signal,
+          log,
+          Math.min(remainMs, 120_000),
+          {
+            messageId,
+            forceActive: true,
+          }
+        )) {
+          track(ev);
+          yield ev;
+          if (ev?.type === "session.next.step.failed" || isFinalStepEnded(ev)) {
+            gotFinal = true;
+            break;
+          }
+        }
+        if (gotFinal) return;
+        log(`重连 SSE #${reconnectAttempt} 结束，尚未最终完成，继续…`);
+      } else {
+        log(`重连 SSE 失败: HTTP ${eventRes.status}`);
+      }
+    } catch (err) {
+      if (signal?.aborted) return;
+      if (!isStreamTerminationError(err) && !/aborted|timeout|TimeoutError/i.test(String(err?.message ?? err))) {
+        log(`重连 SSE 异常: ${err.message}`);
+      }
+    }
+
+    await sleep(1500);
+  }
+
+  // 超时：已有正文则软结束，避免整轮标红失败
+  if (sawSseTextBody || sawToolCall) {
+    log("兜底超时，已有部分 Agent 输出，软结束");
     yield {
       type: "session.next.text.delta",
-      data: { sessionID: sessionId, delta: pollHit.text },
+      data: {
+        sessionID: sessionId,
+        delta:
+          "\n\n*（Agent 未在限时内完整结束。若还需继续改代码，请再发一条消息，或重启 Server 后重试。）*",
+      },
     };
     yield {
       type: "session.next.step.ended",
-      data: {
-        sessionID: sessionId,
-        finish: pollHit.finish || "stop",
-        assistantMessageID: pollHit.messageId,
-      },
+      data: { sessionID: sessionId, finish: "stop", softTimeout: true },
     };
     return;
   }
 
-  if (sseFinishedClean || sawSseTextBody) {
-    return;
-  }
-
-  // SSE 提前断开且没有正文：继续轮询（复杂图片 / 长思考）
-  log(
-    `SSE 提前结束且无正文，继续轮询 /message（最长 ${Math.round(pollTimeoutMs / 1000)}s）…`
-  );
   yield* pollSessionMessagesAsEvents({
     api,
     sessionId,
@@ -806,51 +1410,154 @@ async function* mergeSseWithMessagePoll(sseIter, pollOpts) {
     log,
     messageId,
     afterMs,
-    timeoutMs: pollTimeoutMs,
+    timeoutMs: 30_000,
+    allowPartialOnTimeout: true,
+    alreadyHadText: false,
   });
 }
 
+/**
+ * 在整个 prompt 生命周期（SSE + /message 兜底）内持续处理权限。
+ * 旧逻辑只把权限轮询绑在 SSE 上：SSE 一断权限轮询就停，Agent 若仍在等
+ * external_directory 等授权会永久卡住，UI 一直闪烁。
+ *
+ * 取消时必须能打断 onPermission（否则 await 永不返回，prompt 也无法结束）。
+ */
+async function* withPermissionPolling(inner, permissionContext, signal, log) {
+  if (!permissionContext?.onPermission) {
+    yield* inner;
+    return;
+  }
+
+  const handled = new Set();
+  let polling = true;
+
+  const aborted = () =>
+    new Promise((resolve) => {
+      if (signal?.aborted) {
+        resolve("reject");
+        return;
+      }
+      signal?.addEventListener("abort", () => resolve("reject"), { once: true });
+    });
+
+  const pollPermissions = async () => {
+    while (polling && !signal?.aborted) {
+      let pendingCount = 0;
+      try {
+        const pending = await permissionContext.listPermissions();
+        const list = (Array.isArray(pending) ? pending : extractPermissionList(pending))
+          .map(normalizePermissionRequest)
+          .filter(Boolean);
+        // 合并 SSE 推入的权限（若有）
+        if (Array.isArray(permissionContext.sseInbox)) {
+          while (permissionContext.sseInbox.length) {
+            const n = normalizePermissionRequest(permissionContext.sseInbox.shift());
+            if (n) list.push(n);
+          }
+        }
+        pendingCount = list.length;
+        // 仍出现在 pending 里的，说明上次 reply 没生效，允许重试
+        for (const req of list) {
+          const id = req?.id;
+          if (!id || handled.has(id)) continue;
+          handled.add(id);
+          log(
+            `权限待确认: action=${req.action} resources=${preview(JSON.stringify(req.resources ?? []), 120)} id=${id}`
+          );
+          try {
+            const reply = await Promise.race([
+              permissionContext.onPermission(req),
+              aborted(),
+            ]);
+            if (signal?.aborted || !polling) {
+              try {
+                await permissionContext.replyPermission(id, "reject");
+                log(`取消中，已拒绝权限: requestID=${id}`);
+              } catch {
+                // ignore
+              }
+              return;
+            }
+            await permissionContext.replyPermission(id, reply);
+            // 关键：确认 pending 里已经消失；否则当作失败重试（避免假 200）
+            await sleep(250);
+            const still = (
+              await permissionContext.listPermissions().catch(() => [])
+            )
+              .map(normalizePermissionRequest)
+              .filter(Boolean)
+              .some((p) => p.id === id);
+            if (still) {
+              handled.delete(id);
+              log(
+                `权限回复后仍在 pending，将换一种格式重试: reply=${reply} requestID=${id}`
+              );
+              // 立刻用别名再打一次
+              try {
+                await permissionContext.replyPermission(id, reply, {
+                  forceAlias: true,
+                });
+                await sleep(250);
+                const still2 = (
+                  await permissionContext.listPermissions().catch(() => [])
+                )
+                  .map(normalizePermissionRequest)
+                  .filter(Boolean)
+                  .some((p) => p.id === id);
+                if (still2) {
+                  handled.delete(id);
+                  log(`权限仍未清除，下一轮轮询会再问用户: ${id}`);
+                } else {
+                  log(`权限已确认清除(别名): ${reply} id=${id}`);
+                }
+              } catch (err) {
+                handled.delete(id);
+                log(`权限别名回复失败: ${err?.message ?? err}`);
+              }
+            } else {
+              log(`权限已回复并确认清除: ${reply} (requestID=${id})`);
+            }
+          } catch (err) {
+            const msg = String(err?.message ?? err);
+            if (/404|PermissionNotFound/i.test(msg)) {
+              log(`权限请求已失效，跳过: ${id}`);
+            } else {
+              handled.delete(id);
+              log(`权限回复失败，将重试: ${msg}`);
+            }
+          }
+        }
+      } catch (err) {
+        if (!signal?.aborted) {
+          log(`权限轮询错误: ${err.message}`);
+        }
+      }
+      // 无 pending 时放慢轮询，减少诊断刷屏
+      await sleep(pendingCount > 0 ? 400 : 1600);
+    }
+  };
+
+  const pollTask = pollPermissions();
+  try {
+    yield* inner;
+  } finally {
+    polling = false;
+    // 最多再等一小段，避免 onPermission 死锁拖死整个 prompt
+    await Promise.race([pollTask.catch(() => {}), sleep(1_500)]);
+  }
+}
+
+/** @deprecated 权限轮询已提升到 withPermissionPolling；保留空壳以免旧调用路径崩溃 */
 async function* parseSessionEventsWithPermissions(
   response,
   signal,
   log,
   idleTimeoutMs,
   promptFilter,
-  permissionContext
+  _permissionContext
 ) {
-  const handled = new Set();
-  let polling = true;
-
-  const pollPermissions = async () => {
-    if (!permissionContext?.onPermission) return;
-    while (polling && !signal?.aborted) {
-      try {
-        const pending = await permissionContext.listPermissions();
-        for (const req of pending) {
-          const id = req?.id;
-          if (!id || handled.has(id)) continue;
-          handled.add(id);
-          log(
-            `权限待确认: action=${req.action} resources=${preview(JSON.stringify(req.resources ?? []), 120)}`
-          );
-          const reply = await permissionContext.onPermission(req);
-          await permissionContext.replyPermission(id, reply);
-          log(`权限已回复: ${reply} (requestID=${id})`);
-        }
-      } catch (err) {
-        log(`权限轮询错误: ${err.message}`);
-      }
-      await sleep(400);
-    }
-  };
-
-  const pollTask = pollPermissions();
-  try {
-    yield* parseSessionEvents(response, signal, log, idleTimeoutMs, promptFilter);
-  } finally {
-    polling = false;
-    await pollTask.catch(() => {});
-  }
+  yield* parseSessionEvents(response, signal, log, idleTimeoutMs, promptFilter);
 }
 
 async function* parseSessionEvents(
@@ -868,10 +1575,10 @@ async function* parseSessionEvents(
   let waitingAgentStart = false;
   const agentStartTimeoutMs = 30_000;
   const targetMessageId = promptFilter?.messageId ?? null;
-  let active = !targetMessageId;
+  let active = !targetMessageId || !!promptFilter?.forceActive;
   log(
     targetMessageId
-      ? `SSE 事件流已连接，等待 prompt messageID=${targetMessageId}…`
+      ? `SSE 事件流已连接，等待 prompt messageID=${targetMessageId}${active ? "（已激活）" : ""}…`
       : "SSE 事件流已连接，等待事件…"
   );
 
@@ -1054,7 +1761,14 @@ function createHttpClient(baseURL, auth, directory, log = () => {}, onPermission
     }
     const method = init.method ?? "GET";
     const t0 = Date.now();
-    log(`→ HTTP ${method} ${path}${init.body ? ` body=${preview(init.body, 120)}` : ""}`);
+    // 轮询 /message 时不要逐条打日志，否则诊断通道会被刷爆、看起来像卡住
+    const quietPoll =
+      method === "GET" &&
+      typeof path === "string" &&
+      /\/session\/[^/]+\/message$/.test(path);
+    if (!quietPoll) {
+      log(`→ HTTP ${method} ${path}${init.body ? ` body=${preview(init.body, 120)}` : ""}`);
+    }
 
     let res;
     try {
@@ -1075,7 +1789,7 @@ function createHttpClient(baseURL, auth, directory, log = () => {}, onPermission
     const ms = Date.now() - t0;
     if (!res.ok) {
       log(`✗ HTTP ${method} ${path} → ${res.status} (${ms}ms)`);
-    } else {
+    } else if (!quietPoll) {
       log(`✓ HTTP ${method} ${path} → ${res.status} (${ms}ms)`);
     }
     return res;
@@ -1148,8 +1862,26 @@ function createHttpClient(baseURL, auth, directory, log = () => {}, onPermission
           );
         }
         const json = await res.json();
-        const data = json.data ?? json;
-        return { data: Array.isArray(data) ? data : [] };
+        const normalized = normalizeMessageList(json);
+        return {
+          data: normalized.map((m) => ({
+            id: m.id,
+            type: m.type,
+            finish: m.finish,
+            content: m.content,
+            time: m.time,
+          })),
+        };
+      },
+      /**
+       * 等待 session agent loop idle（POST /wait）。
+       * @returns {{ idle: true }}
+       */
+      async wait(sessionId, options = {}) {
+        const timeoutMs = Math.max(1_000, options.timeoutMs ?? 600_000);
+        const signal = options.signal;
+        await waitForSessionIdle(api, sessionId, signal, log, timeoutMs);
+        return { idle: true };
       },
       async switchModel(sessionId, modelRef) {
         const res = await api(`/session/${sessionId}/model`, {
@@ -1261,8 +1993,9 @@ function createHttpClient(baseURL, auth, directory, log = () => {}, onPermission
                 `prompt 已提交: messageID=${promptMessageId ?? "?"} seq=${promptData?.admittedSeq ?? "?"} afterMs=${promptAfterMs} ${preview(JSON.stringify(promptBody))}`
               );
 
-              log(`连接 SSE: ${apiPrefix}/session/${id}/event`);
-              let eventRes;
+              // 可选连接 SSE 仅作进度；完成判定一律走 poll + wait，不把 SSE 断开当结束。
+              log(`可选连接 SSE（仅进度）: ${apiPrefix}/session/${id}/event`);
+              let eventRes = null;
               try {
                 const sseHeaderTimeout = AbortSignal.timeout(8_000);
                 const sseSignal =
@@ -1273,83 +2006,164 @@ function createHttpClient(baseURL, auth, directory, log = () => {}, onPermission
                   signal: sseSignal,
                   headers: { Accept: "text/event-stream" },
                 });
-              } catch (err) {
-                if (
-                  fetchSignal.aborted ||
-                  !(
-                    err?.name === "TimeoutError" ||
-                    /aborted|timeout/i.test(String(err?.message ?? err))
-                  )
-                ) {
-                  throw err;
+                if (!eventRes.ok) {
+                  log(
+                    `SSE 不可用 (${eventRes.status})，仅用 message 轮询 + wait`
+                  );
+                  eventRes = null;
+                } else {
+                  log(`SSE 已连通（进度通道）`);
                 }
-                log(
-                  `SSE 响应头超时（8s），改为轮询 /message 兜底 messageID=${promptMessageId ?? "?"}`
-                );
-                return pollSessionMessagesAsEvents({
-                  api,
-                  sessionId: id,
-                  signal: fetchSignal,
-                  log,
-                  messageId: promptMessageId,
-                  afterMs: promptAfterMs,
-                });
+              } catch (err) {
+                if (fetchSignal.aborted) throw err;
+                if (
+                  err?.name === "TimeoutError" ||
+                  /aborted|timeout/i.test(String(err?.message ?? err))
+                ) {
+                  log(
+                    `SSE 响应头超时（8s），仅用 message 轮询 + wait messageID=${promptMessageId ?? "?"}`
+                  );
+                  eventRes = null;
+                } else {
+                  log(`SSE 连接失败，降级为轮询+wait: ${err?.message ?? err}`);
+                  eventRes = null;
+                }
               }
-              if (!eventRes.ok) {
-                throw new Error(
-                  `事件流失败 (${eventRes.status}): ${await eventRes.text()}`
-                );
-              }
-              log(`SSE 已连通，开始读事件…`);
 
-              // 与 SSE 并行：若 Agent 已跑完但事件丢失，用消息接口补齐（仅接受本次 prompt 之后的回复）
-              return mergeSseWithMessagePoll(
-                parseSessionEventsWithPermissions(
-                  eventRes,
-                  fetchSignal,
-                  log,
-                  120_000,
-                  {
-                    messageId: promptMessageId,
-                    admittedSeq: promptData?.admittedSeq,
-                  },
-                  onPermission
-                    ? {
-                        listPermissions: async () => {
-                          const res = await api(`/session/${id}/permission`, {
+              const ssePermissionInbox = [];
+              const permissionCtx = onPermission
+                ? {
+                    sseInbox: ssePermissionInbox,
+                    listPermissions: async () => {
+                      // 仅用会话级；全局 GET /permission 在 lildax 上 404，勿每轮空打
+                      const sessionRes = await api(`/session/${id}/permission`, {
+                        signal: fetchSignal,
+                      }).catch(() => null);
+                      if (!sessionRes?.ok) return [];
+                      const json = await sessionRes.json().catch(() => ({}));
+                      const list = extractPermissionList(json)
+                        .map(normalizePermissionRequest)
+                        .filter(Boolean);
+                      if (list.length) {
+                        log(
+                          `会话权限 pending=${list.length}: ${preview(JSON.stringify(list.map((p) => ({ id: p.id, action: p.action, resources: p.resources }))), 200)}`
+                        );
+                      } else {
+                        // 调试：偶发非空 body 却解析不出列表时打预览
+                        const rawPreview = preview(JSON.stringify(json), 160);
+                        if (rawPreview && rawPreview !== "[]" && rawPreview !== "{}" && !/"data"\s*:\s*\[\s*\]/.test(rawPreview)) {
+                          log(`权限列表原始响应: ${rawPreview}`);
+                        }
+                      }
+                      return list;
+                    },
+                    replyPermission: async (requestId, reply, opts = {}) => {
+                      // once/always/reject 与部分版本 allow/always_allow/deny 并存
+                      const primary = String(reply || "reject");
+                      const aliases = {
+                        once: opts.forceAlias
+                          ? ["allow", "once"]
+                          : ["once", "allow"],
+                        always: opts.forceAlias
+                          ? ["always_allow", "always"]
+                          : ["always", "always_allow"],
+                        reject: opts.forceAlias
+                          ? ["deny", "reject"]
+                          : ["reject", "deny"],
+                        allow: ["allow", "once"],
+                        always_allow: ["always_allow", "always"],
+                        deny: ["deny", "reject"],
+                      };
+                      const replyValues = aliases[primary] || [primary];
+
+                      const attempts = [];
+                      for (const r of replyValues) {
+                        attempts.push({
+                          path: `/session/${id}/permission/${requestId}/reply`,
+                          body: { reply: r },
+                          label: `session.permission.reply:${r}`,
+                        });
+                        attempts.push({
+                          path: `/session/${id}/permissions/${requestId}`,
+                          body: { response: r, reply: r },
+                          label: `session.permissions:${r}`,
+                        });
+                      }
+                      // 全局路径放最后，且必须事后用 list 校验（已知会假 200）
+                      for (const r of replyValues) {
+                        attempts.push({
+                          path: `/permission/${requestId}/reply`,
+                          body: { reply: r },
+                          label: `permission.reply:${r}`,
+                          requireClear: true,
+                        });
+                      }
+
+                      let lastErr = null;
+                      for (const a of attempts) {
+                        try {
+                          log(`尝试权限回复 ${a.label} → ${a.path}`);
+                          const res = await api(a.path, {
+                            method: "POST",
+                            body: JSON.stringify(a.body),
                             signal: fetchSignal,
                           });
-                          if (!res.ok) return [];
-                          const json = await res.json().catch(() => ({}));
-                          return json?.data ?? json ?? [];
-                        },
-                        replyPermission: async (requestId, reply) => {
-                          const res = await api(
-                            `/session/${id}/permission/${requestId}/reply`,
-                            {
-                              method: "POST",
-                              body: JSON.stringify({ reply }),
-                              signal: fetchSignal,
-                            }
-                          );
+                          const text = await res.text().catch(() => "");
                           if (!res.ok) {
-                            throw new Error(
-                              `权限回复失败 (${res.status}): ${await res.text()}`
+                            lastErr = new Error(
+                              `权限回复失败 (${res.status}): ${text}`
                             );
+                            if (res.status === 404) continue;
+                            continue;
                           }
-                        },
-                        onPermission,
+                          if (a.requireClear) {
+                            await sleep(200);
+                            const check = await api(`/session/${id}/permission`, {
+                              signal: fetchSignal,
+                            }).catch(() => null);
+                            let still = false;
+                            if (check?.ok) {
+                              const json = await check.json().catch(() => ({}));
+                              still = extractPermissionList(json)
+                                .map(normalizePermissionRequest)
+                                .filter(Boolean)
+                                .some((p) => p.id === requestId);
+                            }
+                            if (still) {
+                              log(
+                                `全局 reply 返回成功但 pending 仍在，继续尝试下一路径`
+                              );
+                              continue;
+                            }
+                          }
+                          log(`权限回复成功: ${a.label}`);
+                          return;
+                        } catch (err) {
+                          lastErr = err;
+                        }
                       }
-                    : null
-                ),
-                {
+                      throw lastErr || new Error("权限回复失败");
+                    },
+                    onPermission,
+                  }
+                : null;
+
+              return withPermissionPolling(
+                completePromptByPollAndWait({
                   api,
                   sessionId: id,
                   signal: fetchSignal,
                   log,
                   messageId: promptMessageId,
                   afterMs: promptAfterMs,
-                }
+                  pollIntervalMs: options.completionPollIntervalMs ?? 1_000,
+                  completionTimeoutMs: options.completionTimeoutMs ?? 600_000,
+                  sseResponse: eventRes,
+                  ssePermissionInbox,
+                }),
+                permissionCtx,
+                fetchSignal,
+                log
               );
             };
 
